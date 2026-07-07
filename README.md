@@ -4,12 +4,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Fire%20TV%20%7C%20Android%20TV-6a0dad?style=for-the-badge&logo=androidtv&logoColor=white)
 ![Min SDK](https://img.shields.io/badge/Min%20Android-5.0%20(API%2021)-00d4ff?style=for-the-badge&logo=android&logoColor=white)
 ![Core](https://img.shields.io/badge/Core-Android%20WebView-1a1a2e?style=for-the-badge&logo=googlechrome&logoColor=white)
-
-<img src="https://user-images.githubusercontent.com/74038190/212284100-561aa473-3905-4a80-b561-0d28506553ee.gif" width="100%">
-
 </div>
-
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:00d4ff,50:6a0dad,100:1a1a2e&height=120&section=footer" width="100%"/>
 <br/>
 
 ## 📡 Table of Contents
