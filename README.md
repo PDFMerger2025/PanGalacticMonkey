@@ -1,20 +1,15 @@
 <div align="center">
-
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:1a1a2e,50:6a0dad,100:00d4ff&height=220&section=header&text=PanGalactic%20Monkey&fontSize=56&fontColor=ffffff&animation=twinkling&fontAlignY=38&desc=A%20Cosmic%20Web%20Browser%20for%20Fire%20TV%20%26%20Android%20TV&descAlignY=58&descSize=18" width="100%"/>
-
-<a href="#"><img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=22&duration=2800&pause=900&color=00D4FF&center=true&vCenter=true&width=650&lines=Browsing+the+galaxy%2C+one+webpage+at+a+time+%F0%9F%9A%80;Built+for+D-pads%2C+not+trackpads+%F0%9F%8E%AE;%F0%9F%91%BD+%2B+%F0%9F%90%92+%3D+%F0%9F%94%A5" alt="Typing SVG" /></a>
-
 <br/>
 
 ![Platform](https://img.shields.io/badge/Platform-Fire%20TV%20%7C%20Android%20TV-6a0dad?style=for-the-badge&logo=androidtv&logoColor=white)
 ![Min SDK](https://img.shields.io/badge/Min%20Android-5.0%20(API%2021)-00d4ff?style=for-the-badge&logo=android&logoColor=white)
 ![Core](https://img.shields.io/badge/Core-Android%20WebView-1a1a2e?style=for-the-badge&logo=googlechrome&logoColor=white)
-![Made%20For](https://img.shields.io/badge/Made%20for-🐒%20Monkeys%20%26%20👽%20Aliens-orange?style=for-the-badge)
 
 <img src="https://user-images.githubusercontent.com/74038190/212284100-561aa473-3905-4a80-b561-0d28506553ee.gif" width="100%">
 
 </div>
 
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:00d4ff,50:6a0dad,100:1a1a2e&height=120&section=footer" width="100%"/>
 <br/>
 
 ## 📡 Table of Contents
@@ -211,9 +206,7 @@
 
 <div align="center">
 
-### *Made for exploring the galaxy, one webpage at a time.* 🚀🐒
-
-<img src="https://user-images.githubusercontent.com/74038190/212284158-e840e285-664b-44d7-b79b-e264b5e54825.gif" width="100%">
+### *Made for exploring the galaxy, one webpage at a time.* 
 
 <img src="https://capsule-render.vercel.app/api?type=waving&color=0:00d4ff,50:6a0dad,100:1a1a2e&height=120&section=footer" width="100%"/>
 
