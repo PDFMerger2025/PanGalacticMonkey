@@ -1,4 +1,6 @@
 <div align="center">
+<img src="https://iili.io/ClKGwts.png" width="50%"/>
+
 <br/>
 
 ![Platform](https://img.shields.io/badge/Platform-Fire%20TV%20%7C%20Android%20TV-6a0dad?style=for-the-badge&logo=androidtv&logoColor=white)
