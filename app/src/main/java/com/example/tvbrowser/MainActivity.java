@@ -2,6 +2,8 @@ package com.example.tvbrowser;
 
 import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -17,7 +19,6 @@ import android.text.InputType;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
-import android.view.LayoutInflater;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.FrameLayout;
 import android.graphics.Color;
@@ -25,6 +26,8 @@ import android.webkit.WebChromeClient;
 import android.webkit.WebChromeClient.CustomViewCallback;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ProgressBar;
@@ -47,11 +50,19 @@ import java.util.HashSet;
 import java.util.Set;
 import android.view.Choreographer;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+
+// For local file picker
+import android.database.Cursor;
+import android.provider.OpenableColumns;
+import java.io.InputStream;
+
 public class MainActivity extends AppCompatActivity {
 
-    /**
-     * Polyfill for Tampermonkey/Greasemonkey GM_* APIs.
-     */
+    // ---------- GM_SHIM_JS ----------
     private static final String GM_SHIM_JS =
             "(function(){" +
             "if(window.GM_getValue)return;" +
@@ -92,7 +103,7 @@ public class MainActivity extends AppCompatActivity {
             "window.unsafeWindow=window;" +
             "})();";
 
-    /** Holds one browser tab's WebView instance plus display metadata. */
+    // ---------- TabData ----------
     private static class TabData {
         CustomWebView view;
         String title = "New Tab";
@@ -140,8 +151,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int MAX_HISTORY_ITEMS = 20;
     private static final String KEY_DOWNLOAD_DIR = "download_dir_uri";
     private static final String KEY_DESKTOP_MODE = "desktop_mode_enabled";
-    private static final float DEFAULT_CURSOR_SPEED = 20f;
-    private static final float DEFAULT_SCROLL_SPEED = 150f;
+    private static final float DEFAULT_CURSOR_SPEED = 8f;
+    private static final float DEFAULT_SCROLL_SPEED = 120f;
     private float scrollStep = DEFAULT_SCROLL_SPEED;
     private boolean privateBrowsingEnabled = false;
 
@@ -179,6 +190,14 @@ public class MainActivity extends AppCompatActivity {
                         return;
                     }
 
+                    if (urlBar.hasFocus()) {
+                        runOnUiThread(() -> {
+                            urlBar.clearFocus();
+                            hideKeyboard();
+                            webView.requestFocus();
+                        });
+                    }
+
                     float deltaMultiplier = 1f;
                     if (lastCursorFrameTimeNanos != 0L) {
                         long deltaNanos = frameTimeNanos - lastCursorFrameTimeNanos;
@@ -203,7 +222,9 @@ public class MainActivity extends AppCompatActivity {
                                     "(function(){return window.scrollY<=0;})();",
                                     result -> {
                                         if ("true".equals(result)) {
-                                            runOnUiThread(MainActivity.this::focusUrlBar);
+                                            if (!urlBar.hasFocus()) {
+                                                runOnUiThread(MainActivity.this::focusUrlBar);
+                                            }
                                         } else {
                                             webView.evaluateJavascript(
                                                     "window.scrollBy(0,-" + scrollStep + ");",
@@ -268,10 +289,16 @@ public class MainActivity extends AppCompatActivity {
         Toast.makeText(this, javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF", Toast.LENGTH_SHORT).show();
     }
 
+    // ---------- Built‑in AdBlock Manager ----------
+    private SimpleAdBlockManager adBlockManager;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        adBlockManager = new SimpleAdBlockManager(this);
+        new Thread(() -> adBlockManager.loadFilters()).start();
 
         tabContainer = findViewById(R.id.tabContainer);
         urlBar = findViewById(R.id.urlBar);
@@ -303,16 +330,8 @@ public class MainActivity extends AppCompatActivity {
 
         goButton.setOnClickListener(v -> webView.reload());
         scriptsButton.setOnClickListener(v -> showScriptsManager());
-        backButton.setOnClickListener(v -> {
-            if (webView.canGoBack()) {
-                webView.goBack();
-            }
-        });
-        forwardButton.setOnClickListener(v -> {
-            if (webView.canGoForward()) {
-                webView.goForward();
-            }
-        });
+        backButton.setOnClickListener(v -> { if (webView.canGoBack()) webView.goBack(); });
+        forwardButton.setOnClickListener(v -> { if (webView.canGoForward()) webView.goForward(); });
         cursorModeButton.setOnClickListener(v -> toggleCursorMode());
         menuButton.setOnClickListener(v -> showBookmarksMenu());
         homeButton.setOnClickListener(v -> webView.loadUrl(getHomepage()));
@@ -335,12 +354,7 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /**
-     * Creates and fully configures a brand new tab (its own WebView
-     * instance, settings, WebViewClient/WebChromeClient callbacks, and JS
-     * interfaces), adds it to the tab container (initially hidden), and
-     * switches to it immediately.
-     */
+    // ---------- addNewTab ----------
     private void addNewTab(String startUrl) {
         CustomWebView wv = new CustomWebView(this);
         wv.setLayoutParams(new FrameLayout.LayoutParams(
@@ -371,6 +385,69 @@ public class MainActivity extends AppCompatActivity {
 
         TabData tab = new TabData();
         tab.view = wv;
+
+        wv.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                if (wv != webView) return;
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    view.evaluateJavascript(GM_SHIM_JS, null);
+                }
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                if (wv != webView) return;
+                urlBar.setText(url);
+                webView.evaluateJavascript("window.__tvKeyboardTarget = null;", null);
+                updateBookmarkStarIcon();
+                updateProgressBar(100);
+                if (!privateBrowsingEnabled) {
+                    recordHistory(view.getTitle(), url);
+                }
+
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    injectAllUserscripts();
+                }
+                injectTabNavigationScript();
+                reInjectTabNav();
+                injectScrollWatcher();
+                stripTargetBlankLinks();
+                if (!cursorModeEnabled) {
+                    webView.evaluateJavascript("window.__tvTabNav && window.__tvTabNav.enable();", null);
+                }
+
+                if (url != null && url.toLowerCase().endsWith(".txt")) {
+                    showTextUrlPopup(url);
+                }
+
+                if (url != null && url.toLowerCase().endsWith(".js")) {
+                    pendingJsUrl = url;
+                    view.evaluateJavascript(
+                            "document.body ? document.body.innerText : ''",
+                            value -> {
+                                pendingJsContent = unescapeJson(value);
+                                if (pendingJsContent != null && !pendingJsContent.isEmpty()) {
+                                    promptInstallScriptWithContent(url);
+                                }
+                            });
+                }
+            }
+
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                if (adBlockManager != null && adBlockManager.isEnabled()) {
+                    String url = request.getUrl().toString();
+                    if (adBlockManager.shouldBlock(url)) {
+                        Log.d("AdBlock", "Blocked: " + url);
+                        return null;
+                    }
+                }
+                return super.shouldInterceptRequest(view, request);
+            }
+        });
 
         wv.setWebChromeClient(new android.webkit.WebChromeClient() {
             @Override
@@ -429,51 +506,6 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        wv.setWebViewClient(new WebViewClient() {
-            @Override
-            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                super.onPageStarted(view, url, favicon);
-                if (wv != webView) return;
-                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                    view.evaluateJavascript(GM_SHIM_JS, null);
-                }
-            }
-
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
-                if (wv != webView) return;
-                urlBar.setText(url);
-                webView.evaluateJavascript("window.__tvKeyboardTarget = null;", null);
-                updateBookmarkStarIcon();
-                updateProgressBar(100);
-                if (!privateBrowsingEnabled) {
-                    recordHistory(view.getTitle(), url);
-                }
-
-                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                    injectAllUserscripts();
-                }
-                injectTabNavigationScript();      // ensure it's there
-                reInjectTabNav();                 // extra safety
-                injectScrollWatcher();
-                stripTargetBlankLinks();
-                if (!cursorModeEnabled) {
-                    webView.evaluateJavascript("window.__tvTabNav && window.__tvTabNav.enable();", null);
-                }
-
-                if (url != null && url.toLowerCase().endsWith(".js")) {
-                    pendingJsUrl = url;
-                    view.evaluateJavascript(
-                            "document.body ? document.body.innerText : ''",
-                            value -> {
-                                pendingJsContent = unescapeJson(value);
-                                promptInstallScript(url);
-                            });
-                }
-            }
-        });
-
         registerDocumentStartScripts(wv);
 
         wv.addJavascriptInterface(new KeyboardBridge(), "AndroidKeyboard");
@@ -489,7 +521,7 @@ public class MainActivity extends AppCompatActivity {
         wv.loadUrl(startUrl);
     }
 
-    /** Shows the tab at the given index and hides all others. */
+    // ---------- switchToTab ----------
     private void switchToTab(int index) {
         if (index < 0 || index >= tabs.size()) return;
         for (int i = 0; i < tabs.size(); i++) {
@@ -503,11 +535,7 @@ public class MainActivity extends AppCompatActivity {
         webView.requestFocus();
     }
 
-    /**
-     * Closes the given tab. If it was the active tab, switches to a
-     * neighboring tab; if it was the only tab left, opens a fresh one at
-     * the homepage so the browser is never left with zero tabs.
-     */
+    // ---------- closeTab ----------
     private void closeTab(int index) {
         if (index < 0 || index >= tabs.size()) return;
         TabData closed = tabs.remove(index);
@@ -535,11 +563,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Shows a simple list of open tabs with each tab's title/url, a
-     * close (X) button per row to end that tab, tap-to-switch behavior,
-     * and a "+ New Tab" button.
-     */
+    // ---------- showTabsSwitcher ----------
     private void showTabsSwitcher() {
         android.widget.LinearLayout container = new android.widget.LinearLayout(this);
         container.setOrientation(android.widget.LinearLayout.VERTICAL);
@@ -672,6 +696,7 @@ public class MainActivity extends AppCompatActivity {
         hideKeyboard();
     }
 
+    // ---------- Bridges ----------
     private class KeyboardBridge {
         @android.webkit.JavascriptInterface
         public void showKeyboard() {
@@ -691,9 +716,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Native GM_xmlhttpRequest implementation.
-     */
     private class GMXhrBridge {
         @android.webkit.JavascriptInterface
         public void request(final String requestId, final String detailsJson) {
@@ -984,6 +1006,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // ---------- Tab navigation script ----------
     private void injectTabNavigationScript() {
         String js = "(function(){" +
             "  if (window.__tvTabNav) { return; }" +
@@ -1046,7 +1069,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void reInjectTabNav() {
-        // Ensure the script is always present after navigation
         injectTabNavigationScript();
     }
 
@@ -1057,7 +1079,6 @@ public class MainActivity extends AppCompatActivity {
             result -> {
                 if (result == null) return;
                 if (result.contains("bottom") || result.contains("empty")) {
-                    // If at the last element or no elements, scroll down
                     webView.evaluateJavascript("window.scrollBy(0," + scrollStep + ");", null);
                 }
             });
@@ -1154,6 +1175,7 @@ public class MainActivity extends AppCompatActivity {
         return getSharedPreferences(PREFS, MODE_PRIVATE);
     }
 
+    // ---------- Scripts management ----------
     private JSONArray loadScripts() {
         String raw = prefs().getString(KEY_SCRIPTS, "[]");
         try {
@@ -1194,16 +1216,159 @@ public class MainActivity extends AppCompatActivity {
         saveScripts(newArr);
     }
 
-    /**
-     * Registers the GM_ shim and every enabled userscript with the WebView's
-     * true "document-start" injection queue.
-     */
-    private void registerDocumentStartScripts(CustomWebView wv) {
-        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            Log.e("TVBrowser", "[AdBlockDiag] DOCUMENT_START_SCRIPT UNSUPPORTED on this WebView");
+    // ---------- Updated showScriptsManager ----------
+    private void showScriptsManager() {
+        JSONArray arr = loadScripts();
+        int count = arr.length();
+        if (count == 0) {
+            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+            builder.setTitle("No userscripts installed");
+            builder.setMessage("You can add a userscript by URL or from a local .js file.");
+            builder.setPositiveButton("Install from URL", (d, w) -> promptInstallScriptFromUrl(null));
+            builder.setNeutralButton("Install from Device", (d, w) -> pickLocalScriptFile());
+            builder.setNegativeButton("Close", null);
+            builder.show();
             return;
         }
-        Log.d("TVBrowser", "[AdBlockDiag] DOCUMENT_START_SCRIPT supported -- registering GM_ shim + userscripts");
+        String[] names = new String[count];
+        for (int i = 0; i < count; i++) {
+            try {
+                names[i] = arr.getJSONObject(i).optString("name", "script " + i);
+            } catch (JSONException e) {
+                names[i] = "script " + i;
+            }
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Installed userscripts (select to remove)");
+        builder.setItems(names, (dialog, which) -> confirmRemove(which, names[which]));
+        builder.setNeutralButton("Install from URL", (d, w) -> promptInstallScriptFromUrl(null));
+        builder.setNegativeButton("Close", null);
+        builder.show();
+    }
+
+    private void promptInstallScriptFromUrl(String url) {
+        if (url != null && !url.isEmpty()) {
+            if (pendingJsContent != null && !pendingJsContent.isEmpty()) {
+                promptInstallScriptWithContent(url);
+                return;
+            }
+        }
+        final EditText input = new EditText(this);
+        input.setHint("https://example.com/script.js");
+        input.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+        new AlertDialog.Builder(this)
+                .setTitle("Install userscript from URL")
+                .setView(input)
+                .setPositiveButton("Install", (d, w) -> {
+                    String urlStr = input.getText().toString().trim();
+                    if (!urlStr.isEmpty()) {
+                        webView.loadUrl(urlStr);
+                    } else {
+                        Toast.makeText(this, "Please enter a URL", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void promptInstallScriptWithContent(String url) {
+        if (pendingJsContent == null || pendingJsContent.isEmpty()) return;
+        String defaultName = url.substring(url.lastIndexOf('/') + 1);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Install userscript?")
+                .setMessage(url)
+                .setPositiveButton("Install", (dialog, which) -> {
+                    addScript(defaultName, url, pendingJsContent);
+                    refreshDocumentStartScriptsOnAllTabs();
+                    pendingJsUrl = null;
+                    pendingJsContent = null;
+                    showTopBar();
+                    if (webView.canGoBack()) {
+                        webView.goBack();
+                    }
+                })
+                .setNegativeButton("Cancel", (dialog, which) -> {
+                    pendingJsUrl = null;
+                    pendingJsContent = null;
+                    showTopBar();
+                    if (webView.canGoBack()) {
+                        webView.goBack();
+                    }
+                })
+                .show();
+    }
+
+    // ---------- Local file picker ----------
+    private static final int REQUEST_CODE_PICK_JS_FILE = 1001;
+
+    private void pickLocalScriptFile() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/javascript");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/javascript", "text/plain"});
+        startActivityForResult(intent, REQUEST_CODE_PICK_JS_FILE);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_CODE_PICK_JS_FILE && resultCode == RESULT_OK && data != null) {
+            Uri uri = data.getData();
+            if (uri != null) {
+                try {
+                    InputStream is = getContentResolver().openInputStream(uri);
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(is));
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line).append("\n");
+                    }
+                    reader.close();
+                    String code = sb.toString();
+
+                    String fileName = getFileName(uri);
+                    if (fileName == null || fileName.isEmpty()) {
+                        fileName = "userscript.js";
+                    }
+
+                    addScript(fileName, uri.toString(), code);
+                    refreshDocumentStartScriptsOnAllTabs();
+                    Toast.makeText(this, "Installed: " + fileName, Toast.LENGTH_SHORT).show();
+                } catch (Exception e) {
+                    Log.e("TVBrowser", "Failed to read script file", e);
+                    Toast.makeText(this, "Failed to read file", Toast.LENGTH_SHORT).show();
+                }
+            }
+        }
+    }
+
+    private String getFileName(Uri uri) {
+        String result = null;
+        if (uri.getScheme().equals("content")) {
+            try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (nameIndex >= 0) {
+                        result = cursor.getString(nameIndex);
+                    }
+                }
+            }
+        }
+        if (result == null) {
+            result = uri.getLastPathSegment();
+        }
+        return result;
+    }
+
+    // ---------- registerDocumentStartScripts ----------
+    private void registerDocumentStartScripts(CustomWebView wv) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            Log.e("TVBrowser", "DOCUMENT_START_SCRIPT UNSUPPORTED on this WebView");
+            return;
+        }
+        Log.d("TVBrowser", "Registering GM_ shim + userscripts via WebViewCompat");
         java.util.List<androidx.webkit.ScriptHandler> existing = documentStartHandlers.get(wv);
         if (existing != null) {
             for (androidx.webkit.ScriptHandler handler : existing) {
@@ -1225,7 +1390,7 @@ public class MainActivity extends AppCompatActivity {
                     String code = obj.getString("code");
                     java.util.Set<String> originRules = parseMatchOriginRules(code);
                     String scriptName = obj.optString("name", "unnamed");
-                    Log.d("TVBrowser", "[AdBlockDiag] Registering userscript '" + scriptName + "' with origin rules: " + originRules);
+                    Log.d("TVBrowser", "Registering userscript '" + scriptName + "' with origin rules: " + originRules);
                     String wrapped = "try{\n" + code + "\n}catch(e){console.error('Userscript error:',e && e.message ? e.message : e);}";
                     handlers.add(WebViewCompat.addDocumentStartJavaScript(wv, wrapped, originRules));
                 }
@@ -1236,9 +1401,6 @@ public class MainActivity extends AppCompatActivity {
         documentStartHandlers.put(wv, handlers);
     }
 
-    /**
-     * Parses @match origin rules.
-     */
     private java.util.Set<String> parseMatchOriginRules(String scriptCode) {
         java.util.Set<String> origins = new java.util.HashSet<>();
         try {
@@ -1274,7 +1436,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /** Re-registers document-start scripts on every currently open tab. */
     private void refreshDocumentStartScriptsOnAllTabs() {
         for (TabData tab : tabs) {
             if (tab.view != null) {
@@ -1301,34 +1462,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void promptInstallScript(String url) {
-        if (pendingJsContent == null || pendingJsContent.isEmpty()) return;
-        String defaultName = url.substring(url.lastIndexOf('/') + 1);
-
-        new AlertDialog.Builder(this)
-                .setTitle("Install userscript?")
-                .setMessage(url)
-                .setPositiveButton("Install", (dialog, which) -> {
-                    addScript(defaultName, url, pendingJsContent);
-                    refreshDocumentStartScriptsOnAllTabs();
-                    pendingJsUrl = null;
-                    pendingJsContent = null;
-                    showTopBar();
-                    if (webView.canGoBack()) {
-                        webView.goBack();
-                    }
-                })
-                .setNegativeButton("Cancel", (dialog, which) -> {
-                    pendingJsUrl = null;
-                    pendingJsContent = null;
-                    showTopBar();
-                    if (webView.canGoBack()) {
-                        webView.goBack();
-                    }
-                })
-                .show();
-    }
-
+    // ---------- Homepage ----------
     private String getHomepage() {
         return prefs().getString(KEY_HOMEPAGE, DEFAULT_HOMEPAGE);
     }
@@ -1337,6 +1471,7 @@ public class MainActivity extends AppCompatActivity {
         prefs().edit().putString(KEY_HOMEPAGE, url).apply();
     }
 
+    // ---------- Bookmarks ----------
     private JSONArray loadBookmarks() {
         String raw = prefs().getString(KEY_BOOKMARKS, "[]");
         try {
@@ -1415,8 +1550,7 @@ public class MainActivity extends AppCompatActivity {
         bookmarkStarButton.setText(isBookmarked ? "\u2605" : "\u2606");
     }
 
-    // ---------------- Downloads ----------------
-
+    // ---------- Downloads ----------
     private void promptDownloadConfirmation(String url, String userAgent, String contentDisposition, String mimetype) {
         final String finalFileName = extractFileName(url, contentDisposition, mimetype);
 
@@ -1905,8 +2039,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ---------------- History ----------------
-
+    // ---------- History ----------
     private JSONArray loadHistory() {
         String raw = prefs().getString(KEY_HISTORY, "[]");
         try {
@@ -2093,8 +2226,7 @@ public class MainActivity extends AppCompatActivity {
         dialogHolder[0].show();
     }
 
-    // ---------------- Private Browsing ----------------
-
+    // ---------- Private Browsing ----------
     private void togglePrivateBrowsing() {
         privateBrowsingEnabled = !privateBrowsingEnabled;
         if (privateBrowsingEnabled) {
@@ -2130,8 +2262,7 @@ public class MainActivity extends AppCompatActivity {
                 Toast.LENGTH_SHORT).show();
     }
 
-    // ---------------- Menu ---------------
-
+    // ---------- Menu ----------
     private void showBookmarksMenu() {
         String[] options = {
             "View Bookmarks",
@@ -2145,7 +2276,10 @@ public class MainActivity extends AppCompatActivity {
             "Zoom In",
             "Zoom Out",
             "Cursor & Scroll Speed",
-            javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF"
+            javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF",
+            "Ad Block Filters",
+            "Whitelist Current Site",
+            "Manage Whitelist"
         };
 
         android.widget.LinearLayout container = new android.widget.LinearLayout(this);
@@ -2177,65 +2311,335 @@ public class MainActivity extends AppCompatActivity {
         listView.setOnItemClickListener((parent, view, position, id) -> {
             dialog.dismiss();
             switch (position) {
-                case 0:
-                    showBookmarksList();
-                    break;
-                case 1:
-                    promptAddBookmark();
-                    break;
-                case 2:
-                    promptChangeHomepage();
-                    break;
-                case 3:
-                    showDownloadsManager();
-                    break;
-                case 4:
-                    showChangeDownloadLocation();
-                    break;
-                case 5:
-                    showHistoryManager();
-                    break;
-                case 6:
-                    togglePrivateBrowsing();
-                    break;
-                case 7:
-                    toggleDesktopMode();
-                    break;
-                case 8:
-                    zoomIn();
-                    break;
-                case 9:
-                    zoomOut();
-                    break;
-                case 10:
-                    showSpeedSettings();
-                    break;
-                case 11:
-                    toggleJavaScript();
-                    break;
+                case 0: showBookmarksList(); break;
+                case 1: promptAddBookmark(); break;
+                case 2: promptChangeHomepage(); break;
+                case 3: showDownloadsManager(); break;
+                case 4: showChangeDownloadLocation(); break;
+                case 5: showHistoryManager(); break;
+                case 6: togglePrivateBrowsing(); break;
+                case 7: toggleDesktopMode(); break;
+                case 8: zoomIn(); break;
+                case 9: zoomOut(); break;
+                case 10: showSpeedSettings(); break;
+                case 11: toggleJavaScript(); break;
+                case 12: showAdBlockManagerDialog(); break;
+                case 13: toggleWhitelistCurrentSite(); break;
+                case 14: showWhitelistManager(); break;
             }
         });
 
         dialog.show();
+        requestDialogButtonFocus(dialog);
     }
 
-    // ---------------- Speed Settings ----------------
+    // ---------- Whitelist ----------
+    private void toggleWhitelistCurrentSite() {
+        String url = webView.getUrl();
+        if (url == null) {
+            Toast.makeText(this, "No page loaded", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String host = Uri.parse(url).getHost();
+        if (host == null) {
+            Toast.makeText(this, "Invalid URL", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        boolean isWhitelisted = adBlockManager.isWhitelisted(host);
+        if (isWhitelisted) {
+            adBlockManager.removeWhitelist(host);
+            Toast.makeText(this, "Removed from whitelist: " + host, Toast.LENGTH_SHORT).show();
+        } else {
+            adBlockManager.addWhitelist(host);
+            Toast.makeText(this, "Added to whitelist: " + host, Toast.LENGTH_SHORT).show();
+        }
+        webView.clearCache(true);
+        webView.reload();
+    }
 
+    private void showWhitelistManager() {
+        Set<String> whitelist = adBlockManager.getWhitelist();
+        if (whitelist.isEmpty()) {
+            Toast.makeText(this, "No sites whitelisted", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Whitelisted Sites");
+        String[] items = whitelist.toArray(new String[0]);
+        builder.setItems(items, (dialog, which) -> {
+            String host = items[which];
+            adBlockManager.removeWhitelist(host);
+            Toast.makeText(this, "Removed: " + host, Toast.LENGTH_SHORT).show();
+            showWhitelistManager();
+        });
+        builder.setNegativeButton("Close", null);
+        AlertDialog dialog = builder.create();
+        dialog.show();
+        requestDialogButtonFocus(dialog);
+    }
+
+    // ---------- AdBlock Manager Dialog (scrollable, in-place update, yellow focus) ----------
+    private AlertDialog adBlockDialog = null;
+
+    private void showAdBlockManagerDialog() {
+        if (adBlockDialog != null && adBlockDialog.isShowing()) {
+            updateAdBlockDialogContent();
+            return;
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Ad Block Filters");
+
+        android.widget.ScrollView scrollView = new android.widget.ScrollView(this);
+        scrollView.setFillViewport(true);
+        android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
+        layout.setOrientation(android.widget.LinearLayout.VERTICAL);
+        layout.setPadding(32, 16, 32, 16);
+
+        buildAdBlockContent(layout);
+
+        scrollView.addView(layout);
+        builder.setView(scrollView);
+        builder.setNegativeButton("Close", (d, w) -> { adBlockDialog = null; });
+
+        adBlockDialog = builder.create();
+        adBlockDialog.show();
+        requestDialogButtonFocus(adBlockDialog);
+    }
+
+    private void updateAdBlockDialogContent() {
+        if (adBlockDialog == null || !adBlockDialog.isShowing()) return;
+        View contentView = adBlockDialog.findViewById(android.R.id.content);
+        if (contentView instanceof android.widget.ScrollView) {
+            android.widget.ScrollView scrollView = (android.widget.ScrollView) contentView;
+            if (scrollView.getChildCount() > 0 && scrollView.getChildAt(0) instanceof android.widget.LinearLayout) {
+                android.widget.LinearLayout layout = (android.widget.LinearLayout) scrollView.getChildAt(0);
+                layout.removeAllViews();
+                buildAdBlockContent(layout);
+                layout.requestLayout();
+            }
+        }
+    }
+
+    private void buildAdBlockContent(android.widget.LinearLayout layout) {
+        // Toggle
+        android.widget.LinearLayout toggleRow = new android.widget.LinearLayout(this);
+        toggleRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        toggleRow.setPadding(0, 0, 0, 16);
+
+        TextView toggleLabel = new TextView(this);
+        toggleLabel.setText("AdBlock Enabled: ");
+        toggleLabel.setTextColor(Color.WHITE);
+        toggleLabel.setTextSize(16f);
+        toggleRow.addView(toggleLabel);
+
+        final Button toggleButton = new Button(this);
+        boolean enabled = adBlockManager.isEnabled();
+        toggleButton.setText(enabled ? "ON" : "OFF");
+        toggleButton.setBackgroundColor(enabled ? Color.GREEN : Color.RED);
+        toggleButton.setOnFocusChangeListener((v, hasFocus) -> {
+            if (hasFocus) toggleButton.setBackgroundColor(Color.YELLOW);
+            else toggleButton.setBackgroundColor(enabled ? Color.GREEN : Color.RED);
+        });
+        toggleButton.setOnClickListener(v -> {
+            boolean newState = !adBlockManager.isEnabled();
+            adBlockManager.setEnabled(newState);
+            toggleButton.setText(newState ? "ON" : "OFF");
+            toggleButton.setBackgroundColor(newState ? Color.GREEN : Color.RED);
+            webView.clearCache(true);
+            webView.reload();
+            Toast.makeText(MainActivity.this, "AdBlock " + (newState ? "enabled" : "disabled"), Toast.LENGTH_SHORT).show();
+        });
+        toggleRow.addView(toggleButton);
+        layout.addView(toggleRow);
+
+        // List filters
+        Set<String> currentUrls = adBlockManager.getFilterUrls();
+        if (currentUrls.isEmpty()) {
+            TextView emptyText = new TextView(this);
+            emptyText.setText("No filter lists added.");
+            emptyText.setTextColor(Color.GRAY);
+            layout.addView(emptyText);
+        } else {
+            for (String url : currentUrls) {
+                android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+                row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+                row.setPadding(0, 8, 0, 8);
+
+                TextView urlText = new TextView(this);
+                urlText.setText(url);
+                urlText.setTextColor(Color.WHITE);
+                urlText.setLayoutParams(new android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+                row.addView(urlText);
+
+                Button removeBtn = new Button(this);
+                removeBtn.setText("Remove");
+                removeBtn.setTextColor(Color.WHITE);
+                removeBtn.setBackgroundColor(Color.RED);
+                removeBtn.setOnFocusChangeListener((v, hasFocus) -> {
+                    if (hasFocus) removeBtn.setBackgroundColor(Color.YELLOW);
+                    else removeBtn.setBackgroundColor(Color.RED);
+                });
+                removeBtn.setOnClickListener(v -> {
+                    adBlockManager.removeFilterUrl(url);
+                    webView.clearCache(true);
+                    updateAdBlockDialogContent();
+                });
+                row.addView(removeBtn);
+                layout.addView(row);
+            }
+        }
+
+        View divider = new View(this);
+        divider.setLayoutParams(new android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 2));
+        divider.setBackgroundColor(Color.GRAY);
+        layout.addView(divider);
+
+        // Add new filter
+        TextView addTitle = new TextView(this);
+        addTitle.setText("Add New Filter List:");
+        addTitle.setTextColor(Color.WHITE);
+        addTitle.setPadding(0, 16, 0, 8);
+        layout.addView(addTitle);
+
+        final EditText input = new EditText(this);
+        input.setHint("https://example.com/filter.txt");
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(Color.GRAY);
+        layout.addView(input);
+
+        android.widget.LinearLayout buttonRow = new android.widget.LinearLayout(this);
+        buttonRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        buttonRow.setPadding(0, 8, 0, 8);
+
+        Button addBtn = new Button(this);
+        addBtn.setText("Add");
+        addBtn.setOnFocusChangeListener((v, hasFocus) -> {
+            if (hasFocus) addBtn.setBackgroundColor(Color.YELLOW);
+            else addBtn.setBackgroundColor(Color.parseColor("#555555"));
+        });
+        addBtn.setOnClickListener(v -> {
+            String url = input.getText().toString().trim();
+            if (!url.isEmpty()) {
+                adBlockManager.addFilterUrl(url);
+                new Thread(() -> adBlockManager.loadFilters()).start();
+                webView.clearCache(true);
+                updateAdBlockDialogContent();
+            } else {
+                Toast.makeText(this, "Please enter a URL", Toast.LENGTH_SHORT).show();
+            }
+        });
+        buttonRow.addView(addBtn);
+
+        Button pasteBtn = new Button(this);
+        pasteBtn.setText("Paste");
+        pasteBtn.setOnFocusChangeListener((v, hasFocus) -> {
+            if (hasFocus) pasteBtn.setBackgroundColor(Color.YELLOW);
+            else pasteBtn.setBackgroundColor(Color.parseColor("#555555"));
+        });
+        pasteBtn.setOnClickListener(v -> {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard.hasPrimaryClip()) {
+                ClipData.Item item = clipboard.getPrimaryClip().getItemAt(0);
+                String text = item.getText().toString();
+                if (text != null) input.setText(text);
+            }
+        });
+        buttonRow.addView(pasteBtn);
+
+        layout.addView(buttonRow);
+
+        // Presets
+        TextView presetTitle = new TextView(this);
+        presetTitle.setText("Quick Add Presets:");
+        presetTitle.setTextColor(Color.WHITE);
+        presetTitle.setPadding(0, 16, 0, 8);
+        layout.addView(presetTitle);
+
+        android.widget.LinearLayout presetRow1 = new android.widget.LinearLayout(this);
+        presetRow1.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        presetRow1.setPadding(0, 0, 0, 8);
+
+        android.widget.LinearLayout presetRow2 = new android.widget.LinearLayout(this);
+        presetRow2.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+
+        String[][] presets = {
+            {"Fanboy Annoyances", "https://easylist.to/easylist/fanboy-annoyance.txt"},
+            {"EasyList Cookie", "https://easylist.to/easylist/easyprivacy.txt"},
+            {"AdGuard Mobile", "https://filters.adtidy.org/extension/chromium/filters/11.txt"},
+            {"NoCoin", "https://filters.adtidy.org/extension/chromium/filters/242.txt"}
+        };
+
+        for (int i = 0; i < presets.length; i++) {
+            final String name = presets[i][0];
+            final String url = presets[i][1];
+            Button presetBtn = new Button(this);
+            presetBtn.setText(name);
+            presetBtn.setOnFocusChangeListener((v, hasFocus) -> {
+                if (hasFocus) presetBtn.setBackgroundColor(Color.YELLOW);
+                else presetBtn.setBackgroundColor(Color.parseColor("#555555"));
+            });
+            presetBtn.setOnClickListener(v -> {
+                adBlockManager.addFilterUrl(url);
+                new Thread(() -> adBlockManager.loadFilters()).start();
+                webView.clearCache(true);
+                Toast.makeText(MainActivity.this, "Added " + name, Toast.LENGTH_SHORT).show();
+                updateAdBlockDialogContent();
+            });
+            if (i < 2) presetRow1.addView(presetBtn);
+            else presetRow2.addView(presetBtn);
+        }
+        layout.addView(presetRow1);
+        layout.addView(presetRow2);
+
+        View spacer = new View(this);
+        spacer.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 16));
+        layout.addView(spacer);
+    }
+
+    // ---------- Speed Settings ----------
     private void showSpeedSettings() {
         android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
         layout.setOrientation(android.widget.LinearLayout.VERTICAL);
         layout.setPadding(32, 16, 32, 16);
 
-        android.widget.TextView cursorLabel = new android.widget.TextView(this);
+        TextView cursorLabel = new TextView(this);
         cursorLabel.setText("Cursor Speed: " + (int) cursorStep);
         layout.addView(cursorLabel);
 
         android.widget.SeekBar cursorSeek = new android.widget.SeekBar(this);
         cursorSeek.setMax(90);
         cursorSeek.setProgress((int) cursorStep - 10);
+        cursorSeek.setKeyProgressIncrement(1);
         layout.addView(cursorSeek);
 
-        android.widget.TextView scrollLabel = new android.widget.TextView(this);
+        android.widget.LinearLayout cursorBtnRow = new android.widget.LinearLayout(this);
+        cursorBtnRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        Button cursorDec = new Button(this);
+        cursorDec.setText("-1");
+        cursorDec.setOnClickListener(v -> {
+            int val = (int) cursorStep - 1;
+            if (val < 10) val = 10;
+            cursorStep = val;
+            cursorSeek.setProgress(val - 10);
+            cursorLabel.setText("Cursor Speed: " + val);
+        });
+        cursorBtnRow.addView(cursorDec);
+
+        Button cursorInc = new Button(this);
+        cursorInc.setText("+1");
+        cursorInc.setOnClickListener(v -> {
+            int val = (int) cursorStep + 1;
+            if (val > 100) val = 100;
+            cursorStep = val;
+            cursorSeek.setProgress(val - 10);
+            cursorLabel.setText("Cursor Speed: " + val);
+        });
+        cursorBtnRow.addView(cursorInc);
+        layout.addView(cursorBtnRow);
+
+        TextView scrollLabel = new TextView(this);
         scrollLabel.setText("Scroll Speed: " + (int) scrollStep);
         scrollLabel.setPadding(0, 24, 0, 0);
         layout.addView(scrollLabel);
@@ -2243,12 +2647,40 @@ public class MainActivity extends AppCompatActivity {
         android.widget.SeekBar scrollSeek = new android.widget.SeekBar(this);
         scrollSeek.setMax(380);
         scrollSeek.setProgress((int) scrollStep - 20);
+        scrollSeek.setKeyProgressIncrement(1);
         layout.addView(scrollSeek);
+
+        android.widget.LinearLayout scrollBtnRow = new android.widget.LinearLayout(this);
+        scrollBtnRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        Button scrollDec = new Button(this);
+        scrollDec.setText("-1");
+        scrollDec.setOnClickListener(v -> {
+            int val = (int) scrollStep - 1;
+            if (val < 20) val = 20;
+            scrollStep = val;
+            scrollSeek.setProgress(val - 20);
+            scrollLabel.setText("Scroll Speed: " + val);
+        });
+        scrollBtnRow.addView(scrollDec);
+
+        Button scrollInc = new Button(this);
+        scrollInc.setText("+1");
+        scrollInc.setOnClickListener(v -> {
+            int val = (int) scrollStep + 1;
+            if (val > 400) val = 400;
+            scrollStep = val;
+            scrollSeek.setProgress(val - 20);
+            scrollLabel.setText("Scroll Speed: " + val);
+        });
+        scrollBtnRow.addView(scrollInc);
+        layout.addView(scrollBtnRow);
 
         cursorSeek.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(android.widget.SeekBar seekBar, int progress, boolean fromUser) {
-                cursorLabel.setText("Cursor Speed: " + (progress + 10));
+                int val = progress + 10;
+                cursorStep = val;
+                cursorLabel.setText("Cursor Speed: " + val);
             }
             @Override public void onStartTrackingTouch(android.widget.SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(android.widget.SeekBar seekBar) {}
@@ -2257,7 +2689,9 @@ public class MainActivity extends AppCompatActivity {
         scrollSeek.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(android.widget.SeekBar seekBar, int progress, boolean fromUser) {
-                scrollLabel.setText("Scroll Speed: " + (progress + 20));
+                int val = progress + 20;
+                scrollStep = val;
+                scrollLabel.setText("Scroll Speed: " + val);
             }
             @Override public void onStartTrackingTouch(android.widget.SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(android.widget.SeekBar seekBar) {}
@@ -2267,8 +2701,6 @@ public class MainActivity extends AppCompatActivity {
                 .setTitle("Cursor & Scroll Speed")
                 .setView(layout)
                 .setPositiveButton("Save", (d, w) -> {
-                    cursorStep = cursorSeek.getProgress() + 10;
-                    scrollStep = scrollSeek.getProgress() + 20;
                     prefs().edit()
                             .putFloat(KEY_CURSOR_SPEED, cursorStep)
                             .putFloat(KEY_SCROLL_SPEED, scrollStep)
@@ -2373,29 +2805,6 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    private void showScriptsManager() {
-        JSONArray arr = loadScripts();
-        int count = arr.length();
-        if (count == 0) {
-            Toast.makeText(this, "No userscripts installed", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        String[] names = new String[count];
-        for (int i = 0; i < count; i++) {
-            try {
-                names[i] = arr.getJSONObject(i).optString("name", "script " + i);
-            } catch (JSONException e) {
-                names[i] = "script " + i;
-            }
-        }
-
-        new AlertDialog.Builder(this)
-                .setTitle("Installed userscripts (select to remove)")
-                .setItems(names, (dialog, which) -> confirmRemove(which, names[which]))
-                .setNegativeButton("Close", null)
-                .show();
-    }
-
     private void confirmRemove(int index, String name) {
         new AlertDialog.Builder(this)
                 .setTitle("Remove script?")
@@ -2420,8 +2829,135 @@ public class MainActivity extends AppCompatActivity {
                 .replace("\\\\", "\\");
     }
 
-    // ---------------- Key Events ----------------
+    // ---------- .txt popup ----------
+    private void showTextUrlPopup(String url) {
+        runOnUiThread(() -> {
+            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+            builder.setTitle("Filter List URL");
+            builder.setMessage("Copy this URL to add it as a filter list:\n\n" + url);
+            builder.setPositiveButton("Copy URL", (d, w) -> {
+                copyToClipboard("Filter URL", url);
+            });
+            builder.setNegativeButton("Close", null);
+            AlertDialog dialog = builder.create();
+            dialog.show();
+            requestDialogButtonFocus(dialog);
+        });
+    }
 
+    private void copyToClipboard(String label, String text) {
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        ClipData clip = ClipData.newPlainText(label, text);
+        clipboard.setPrimaryClip(clip);
+        Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show();
+    }
+
+    // ---------- Long-press link popup ----------
+    private void showLinkPopup(String url, String text) {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Link");
+        String display = text.isEmpty() ? url : text + "\n" + url;
+        builder.setMessage(display);
+        builder.setPositiveButton("Copy Link", (d, w) -> copyToClipboard("Link", url));
+        builder.setNegativeButton("Close", null);
+        AlertDialog dialog = builder.create();
+        dialog.show();
+        requestDialogButtonFocus(dialog);
+    }
+
+    // ---------- Unified long-press ----------
+    private void checkLongPressForElement() {
+        String currentUrl = webView.getUrl();
+        if (hasSaveableExtension(currentUrl)) {
+            offerSaveForUrl(currentUrl);
+            return;
+        }
+
+        String js;
+        if (cursorModeEnabled) {
+            int[] cursorLoc = new int[2];
+            cursorView.getLocationOnScreen(cursorLoc);
+            float screenX = cursorLoc[0] + cursorView.getCursorX();
+            float screenY = cursorLoc[1] + cursorView.getCursorY();
+
+            int[] webViewLoc = new int[2];
+            webView.getLocationOnScreen(webViewLoc);
+            float localX = screenX - webViewLoc[0];
+            float localY = screenY - webViewLoc[1];
+
+            js = "(function(){" +
+                "  var ratio = window.devicePixelRatio || 1;" +
+                "  var cssX = " + localX + " / ratio;" +
+                "  var cssY = " + localY + " / ratio;" +
+                "  var el = document.elementFromPoint(cssX, cssY);" +
+                "  return el ? __tvResolveElement(el) : '';" +
+                "})()";
+        } else {
+            js = "(function(){" +
+                "  var el = document.activeElement;" +
+                "  return el ? __tvResolveElement(el) : '';" +
+                "})()";
+        }
+
+        String helper =
+            "window.__tvResolveElement = window.__tvResolveElement || function(el){" +
+            "  var cur = el;" +
+            "  for (var depth = 0; cur && depth < 4; depth++, cur = cur.parentElement) {" +
+            "    if (cur.tagName === 'IMG' && cur.src) return 'img|' + cur.src;" +
+            "    if ((cur.tagName === 'VIDEO' || cur.tagName === 'AUDIO')) {" +
+            "      var src = cur.currentSrc || cur.src || (cur.querySelector('source[src]') ? cur.querySelector('source[src]').src : '');" +
+            "      if (src) return 'media|' + src;" +
+            "    }" +
+            "    if (cur.tagName === 'A' && cur.href) return 'link|' + cur.href + '|' + (cur.innerText || cur.textContent || '');" +
+            "    var bg = window.getComputedStyle(cur).backgroundImage;" +
+            "    var m = bg && bg.match(/url\\(['\"]?(.*?)['\"]?\\)/);" +
+            "    if (m && m[1]) return 'img|' + m[1];" +
+            "  }" +
+            "  return '';" +
+            "};";
+
+        webView.evaluateJavascript(helper + js, result -> {
+            String data = unescapeJson(result);
+            if (data == null || data.isEmpty()) return;
+            String[] parts = data.split("\\|", -1);
+            if (parts.length < 2) return;
+            String type = parts[0];
+            String url = parts[1];
+            if (type.equals("link")) {
+                String linkText = parts.length > 2 ? parts[2] : "";
+                runOnUiThread(() -> showLinkPopup(url, linkText));
+            } else if (type.equals("img") || type.equals("media")) {
+                runOnUiThread(() -> offerSaveForUrl(url));
+            }
+        });
+    }
+
+    private void checkLongPressForImage() {
+        checkLongPressForElement();
+    }
+
+    // ---------- Dialog focus helper ----------
+    private void requestDialogButtonFocus(AlertDialog dialog) {
+        for (int which : new int[]{AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEUTRAL, AlertDialog.BUTTON_NEGATIVE}) {
+            android.widget.Button btn = dialog.getButton(which);
+            if (btn != null) {
+                btn.setFocusable(true);
+                btn.setFocusableInTouchMode(true);
+            }
+        }
+        android.widget.Button preferred = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        if (preferred == null) preferred = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+        if (preferred == null) preferred = dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+        if (preferred != null) {
+            final android.widget.Button toFocus = preferred;
+            toFocus.post(() -> {
+                toFocus.requestFocus();
+                toFocus.requestFocusFromTouch();
+            });
+        }
+    }
+
+    // ---------- Key Events ----------
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
@@ -2549,6 +3085,14 @@ public class MainActivity extends AppCompatActivity {
 
         if (isDirectionKey) {
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                // If url bar has focus, clear it immediately
+                if (urlBar.hasFocus()) {
+                    runOnUiThread(() -> {
+                        urlBar.clearFocus();
+                        hideKeyboard();
+                        webView.requestFocus();
+                    });
+                }
                 if (heldDirectionKeys.isEmpty()) {
                     cursorMoveStartTime = System.currentTimeMillis();
                 }
@@ -2619,8 +3163,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ---------------- Click Simulation ----------------
-
+    // ---------- Click Simulation ----------
     private void simulateClick(float x, float y) {
         int[] cursorLoc = new int[2];
         cursorView.getLocationOnScreen(cursorLoc);
@@ -2723,8 +3266,7 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
     }
 
-    // ---------------- Image Save (Long Press) ----------------
-
+    // ---------- Image/Media Save ----------
     private static final java.util.Set<String> SAVEABLE_EXTENSIONS = new java.util.HashSet<>(java.util.Arrays.asList(
         "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg",
         "mp4", "webm", "mkv", "mov", "avi", "3gp", "m4v",
@@ -2745,67 +3287,6 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             return false;
         }
-    }
-
-    private void checkLongPressForImage() {
-        String currentUrl = webView.getUrl();
-        if (hasSaveableExtension(currentUrl)) {
-            offerSaveForUrl(currentUrl);
-            return;
-        }
-
-        String js;
-        if (cursorModeEnabled) {
-            int[] cursorLoc = new int[2];
-            cursorView.getLocationOnScreen(cursorLoc);
-            float screenX = cursorLoc[0] + cursorView.getCursorX();
-            float screenY = cursorLoc[1] + cursorView.getCursorY();
-
-            int[] webViewLoc = new int[2];
-            webView.getLocationOnScreen(webViewLoc);
-            float localX = screenX - webViewLoc[0];
-            float localY = screenY - webViewLoc[1];
-
-            js = "(function(){" +
-                "  var ratio = window.devicePixelRatio || 1;" +
-                "  var cssX = " + localX + " / ratio;" +
-                "  var cssY = " + localY + " / ratio;" +
-                "  var el = document.elementFromPoint(cssX, cssY);" +
-                "  return el ? __tvResolveMediaUrl(el) : '';" +
-                "})()";
-        } else {
-            js = "(function(){" +
-                "  var el = document.activeElement;" +
-                "  return el ? __tvResolveMediaUrl(el) : '';" +
-                "})()";
-        }
-
-        String helper =
-            "window.__tvResolveMediaUrl = window.__tvResolveMediaUrl || function(el){" +
-            "  var cur = el;" +
-            "  for (var depth = 0; cur && depth < 4; depth++, cur = cur.parentElement) {" +
-            "    if (cur.tagName === 'IMG' && cur.src) return cur.src;" +
-            "    if ((cur.tagName === 'VIDEO' || cur.tagName === 'AUDIO')) {" +
-            "      if (cur.currentSrc) return cur.currentSrc;" +
-            "      if (cur.src) return cur.src;" +
-            "      var source = cur.querySelector('source[src]');" +
-            "      if (source) return source.src;" +
-            "    }" +
-            "    if (cur.tagName === 'A' && cur.href) return cur.href;" +
-            "    var bg = window.getComputedStyle(cur).backgroundImage;" +
-            "    var m = bg && bg.match(/url\\(['\"]?(.*?)['\"]?\\)/);" +
-            "    if (m && m[1]) return m[1];" +
-            "  }" +
-            "  return '';" +
-            "};";
-
-        webView.evaluateJavascript(helper + js, result -> {
-            String mediaUrl = unescapeJson(result);
-            if (mediaUrl == null || mediaUrl.isEmpty()) {
-                return;
-            }
-            runOnUiThread(() -> offerSaveForUrl(mediaUrl));
-        });
     }
 
     private void offerSaveForUrl(String url) {
@@ -2836,5 +3317,193 @@ public class MainActivity extends AppCompatActivity {
                 downTime, upTime, MotionEvent.ACTION_UP, localX, localY, 0);
         webView.dispatchTouchEvent(up);
         up.recycle();
+    }
+
+    // ---------- SimpleAdBlockManager (inner class) ----------
+    private static class SimpleAdBlockManager {
+        private final Context context;
+        private final Set<String> blockedDomains = new HashSet<>();
+        private final Set<String> exceptionDomains = new HashSet<>();
+        private final Set<String> filterUrls = new HashSet<>();
+        private final Set<String> whitelist = new HashSet<>();
+        private boolean enabled = true;
+        private static final String PREFS_NAME = "adblock_prefs";
+        private static final String KEY_FILTER_URLS = "filter_urls";
+        private static final String KEY_WHITELIST = "whitelist";
+        private static final String KEY_ENABLED = "adblock_enabled";
+        private static final String KEY_INITIALIZED = "adblock_initialized";
+
+        public SimpleAdBlockManager(Context context) {
+            this.context = context.getApplicationContext();
+            loadFilterUrlsFromPrefs();
+            loadWhitelistFromPrefs();
+            loadEnabledFromPrefs();
+            if (!prefs().contains(KEY_INITIALIZED)) {
+                filterUrls.add("https://easylist.to/easylist/easylist.txt");
+                prefs().edit().putBoolean(KEY_INITIALIZED, true).apply();
+                saveFilterUrlsToPrefs();
+            }
+        }
+
+        private SharedPreferences prefs() {
+            return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        }
+
+        private void loadFilterUrlsFromPrefs() {
+            Set<String> saved = prefs().getStringSet(KEY_FILTER_URLS, new HashSet<>());
+            filterUrls.clear();
+            filterUrls.addAll(saved);
+        }
+
+        private void saveFilterUrlsToPrefs() {
+            prefs().edit().putStringSet(KEY_FILTER_URLS, filterUrls).apply();
+        }
+
+        private void loadWhitelistFromPrefs() {
+            Set<String> saved = prefs().getStringSet(KEY_WHITELIST, new HashSet<>());
+            whitelist.clear();
+            whitelist.addAll(saved);
+        }
+
+        private void saveWhitelistToPrefs() {
+            prefs().edit().putStringSet(KEY_WHITELIST, whitelist).apply();
+        }
+
+        private void loadEnabledFromPrefs() {
+            enabled = prefs().getBoolean(KEY_ENABLED, true);
+        }
+
+        private void saveEnabledToPrefs() {
+            prefs().edit().putBoolean(KEY_ENABLED, enabled).apply();
+        }
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+            saveEnabledToPrefs();
+        }
+
+        public Set<String> getFilterUrls() {
+            return new HashSet<>(filterUrls);
+        }
+
+        public void addFilterUrl(String url) {
+            if (url != null && !url.isEmpty()) {
+                filterUrls.add(url);
+                saveFilterUrlsToPrefs();
+            }
+        }
+
+        public void removeFilterUrl(String url) {
+            filterUrls.remove(url);
+            saveFilterUrlsToPrefs();
+            loadFilters();
+        }
+
+        public boolean isWhitelisted(String host) {
+            return whitelist.contains(host);
+        }
+
+        public void addWhitelist(String host) {
+            whitelist.add(host);
+            saveWhitelistToPrefs();
+        }
+
+        public void removeWhitelist(String host) {
+            whitelist.remove(host);
+            saveWhitelistToPrefs();
+        }
+
+        public Set<String> getWhitelist() {
+            return new HashSet<>(whitelist);
+        }
+
+        public void loadFilters() {
+            blockedDomains.clear();
+            exceptionDomains.clear();
+            if (filterUrls.isEmpty()) {
+                return;
+            }
+            for (String url : filterUrls) {
+                try {
+                    String content = download(url);
+                    if (content != null) parseFilterList(content);
+                } catch (Exception e) {
+                    Log.e("AdBlock", "Failed to load filter: " + url, e);
+                }
+            }
+        }
+
+        private String download(String urlString) {
+            HttpURLConnection conn = null;
+            try {
+                URL url = new URL(urlString);
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(15000);
+                conn.connect();
+                if (conn.getResponseCode() == HttpURLConnection.HTTP_OK) {
+                    StringBuilder sb = new StringBuilder();
+                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) sb.append(line).append("\n");
+                    }
+                    return sb.toString();
+                }
+            } catch (Exception e) {
+                Log.e("AdBlock", "Download failed", e);
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+            return null;
+        }
+
+        private void parseFilterList(String content) {
+            String[] lines = content.split("\\n");
+            for (String line : lines) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("!") || line.startsWith("[Adblock")) continue;
+
+                boolean isException = false;
+                if (line.startsWith("@@")) {
+                    isException = true;
+                    line = line.substring(2);
+                }
+
+                if (line.startsWith("||")) {
+                    int end = line.indexOf("^", 2);
+                    if (end > 2) {
+                        String domain = line.substring(2, end);
+                        if (domain.startsWith(".")) domain = domain.substring(1);
+                        if (isException) exceptionDomains.add(domain);
+                        else blockedDomains.add(domain);
+                    }
+                }
+            }
+        }
+
+        public boolean shouldBlock(String url) {
+            if (!enabled) return false;
+            if (url == null) return false;
+            try {
+                Uri uri = Uri.parse(url);
+                String host = uri.getHost();
+                if (host == null) return false;
+
+                if (whitelist.contains(host)) return false;
+
+                for (String exception : exceptionDomains) {
+                    if (host.equals(exception) || host.endsWith("." + exception)) return false;
+                }
+
+                for (String blocked : blockedDomains) {
+                    if (host.equals(blocked) || host.endsWith("." + blocked)) return true;
+                }
+            } catch (Exception e) { /* ignore */ }
+            return false;
+        }
     }
 }
