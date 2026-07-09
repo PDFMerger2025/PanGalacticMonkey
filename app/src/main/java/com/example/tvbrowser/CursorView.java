@@ -21,6 +21,10 @@ public class CursorView extends View {
 
     public CursorView(Context context, AttributeSet attrs) {
         super(context, attrs);
+
+        // GPU‑composited layer – no software redraws
+        setLayerType(View.LAYER_TYPE_HARDWARE, null);
+
         radius = context.getResources().getDisplayMetrics().density * 12f;
 
         fillPaint = new Paint();
@@ -43,16 +47,18 @@ public class CursorView extends View {
     public void setCursorPosition(float newX, float newY) {
         this.x = newX;
         this.y = newY;
-        invalidate();
+        invalidate();   // kept for compatibility
     }
 
-    public float getCursorX() {
-        return x;
+    // Called from the Choreographer loop – schedules draw on next vsync
+    public void setCursorPositionFast(float newX, float newY) {
+        this.x = newX;
+        this.y = newY;
+        postInvalidateOnAnimation();
     }
 
-    public float getCursorY() {
-        return y;
-    }
+    public float getCursorX() { return x; }
+    public float getCursorY() { return y; }
 
     @Override
     protected void onDraw(Canvas canvas) {

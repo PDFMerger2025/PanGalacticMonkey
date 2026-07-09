@@ -34,6 +34,8 @@ import android.text.Editable;
 import android.text.TextWatcher;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -41,8 +43,54 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
+import android.view.Choreographer;
 
 public class MainActivity extends AppCompatActivity {
+
+    /**
+     * Polyfill for Tampermonkey/Greasemonkey GM_* APIs.
+     */
+    private static final String GM_SHIM_JS =
+            "(function(){" +
+            "if(window.GM_getValue)return;" +
+            "var P='__gm_';" +
+            "window.GM_getValue=function(k,d){try{var v=localStorage.getItem(P+k);return v===null?d:JSON.parse(v);}catch(e){return d;}};" +
+            "window.GM_setValue=function(k,v){try{localStorage.setItem(P+k,JSON.stringify(v));}catch(e){}};" +
+            "window.GM_deleteValue=function(k){try{localStorage.removeItem(P+k);}catch(e){}};" +
+            "window.GM_listValues=function(){var o=[];try{for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);if(k.indexOf(P)===0)o.push(k.slice(P.length));}}catch(e){}return o;};" +
+            "window.GM_addStyle=function(css){var s=document.createElement('style');s.textContent=css;(document.head||document.documentElement).appendChild(s);return s;};" +
+            "window.__gmXhrCallbacks={};" +
+            "window.__gmXhrCallback=function(id,json){" +
+            "var cb=window.__gmXhrCallbacks[id];if(!cb)return;delete window.__gmXhrCallbacks[id];" +
+            "try{var r=JSON.parse(json);" +
+            "if(r.ok){if(cb.onload)cb.onload({status:r.status,statusText:r.statusText||'',responseText:r.responseText,response:r.response});}" +
+            "else{if(cb.onerror)cb.onerror(r.error||'GM_xmlhttpRequest failed');}" +
+            "}catch(e){if(cb.onerror)cb.onerror(e);}};" +
+            "window.GM_xmlhttpRequest=function(d){" +
+            "try{" +
+            "if(window.AndroidGMXhr&&window.AndroidGMXhr.request){" +
+            "var id='gmxhr_'+Date.now()+'_'+Math.random().toString(36).slice(2);" +
+            "window.__gmXhrCallbacks[id]={onload:d.onload,onerror:d.onerror};" +
+            "var details={method:d.method||'GET',url:d.url,headers:d.headers||{},data:d.data||'',timeout:d.timeout||15000};" +
+            "window.AndroidGMXhr.request(id,JSON.stringify(details));" +
+            "}else{" +
+            "var x=new XMLHttpRequest();x.open(d.method||'GET',d.url,true);" +
+            "if(d.headers){for(var h in d.headers){try{x.setRequestHeader(h,d.headers[h]);}catch(e){}}}" +
+            "if(d.timeout)x.timeout=d.timeout;" +
+            "x.onload=function(){if(d.onload)d.onload({status:x.status,statusText:x.statusText,responseText:x.responseText,response:x.response});};" +
+            "x.onerror=function(e){if(d.onerror)d.onerror(e);};" +
+            "x.ontimeout=function(e){if(d.ontimeout)d.ontimeout(e);};" +
+            "x.send(d.data||null);" +
+            "}" +
+            "}catch(e){if(d.onerror)d.onerror(e);}};" +
+            "window.GM_openInTab=function(url){window.open(url,'_blank');};" +
+            "window.GM_notification=function(o){try{console.log('[GM_notification]',o);}catch(e){}};" +
+            "window.GM_setClipboard=function(t){try{var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);}catch(e){}};" +
+            "window.GM_info={script:{name:'userscript',version:'1.0'},version:'1.0'};" +
+            "window.unsafeWindow=window;" +
+            "})();";
 
     /** Holds one browser tab's WebView instance plus display metadata. */
     private static class TabData {
@@ -51,6 +99,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private final List<TabData> tabs = new ArrayList<>();
+    private final java.util.Map<CustomWebView, java.util.List<androidx.webkit.ScriptHandler>> documentStartHandlers = new java.util.HashMap<>();
     private int activeTabIndex = -1;
     private FrameLayout tabContainer;
 
@@ -90,14 +139,134 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_HISTORY = "history_json";
     private static final int MAX_HISTORY_ITEMS = 20;
     private static final String KEY_DOWNLOAD_DIR = "download_dir_uri";
-    private static final float DEFAULT_CURSOR_SPEED = 40f;
-    private static final float DEFAULT_SCROLL_SPEED = 120f;
+    private static final String KEY_DESKTOP_MODE = "desktop_mode_enabled";
+    private static final float DEFAULT_CURSOR_SPEED = 20f;
+    private static final float DEFAULT_SCROLL_SPEED = 150f;
     private float scrollStep = DEFAULT_SCROLL_SPEED;
     private boolean privateBrowsingEnabled = false;
+
+    private static final String MOBILE_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+    private static final String DESKTOP_USER_AGENT =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    private boolean desktopModeEnabled = false;
 
     private String pendingJsUrl = null;
     private String pendingJsContent = null;
     private android.content.BroadcastReceiver downloadCompleteReceiver;
+
+    // ---------- JavaScript Toggle ----------
+    private static final String KEY_JS_ENABLED = "js_enabled";
+    private boolean javascriptEnabled = true;
+
+    // ---------- Smooth GPU cursor ----------
+    private final Set<Integer> heldDirectionKeys = new HashSet<>();
+    private long cursorMoveStartTime = 0L;
+    private long lastCursorFrameTimeNanos = 0L;
+    private static final float CURSOR_MAX_MULTIPLIER = 3.0f;
+    private static final long CURSOR_RAMP_DURATION_MS = 600L;
+    private boolean cursorFrameLoopRunning = false;
+
+    private final Choreographer.FrameCallback cursorFrameCallback =
+            new Choreographer.FrameCallback() {
+                @Override
+                public void doFrame(long frameTimeNanos) {
+                    if (heldDirectionKeys.isEmpty() || !cursorModeEnabled) {
+                        cursorFrameLoopRunning = false;
+                        lastCursorFrameTimeNanos = 0L;
+                        return;
+                    }
+
+                    float deltaMultiplier = 1f;
+                    if (lastCursorFrameTimeNanos != 0L) {
+                        long deltaNanos = frameTimeNanos - lastCursorFrameTimeNanos;
+                        float deltaMs = deltaNanos / 1_000_000f;
+                        deltaMultiplier = deltaMs / 16.6667f;
+                    }
+                    lastCursorFrameTimeNanos = frameTimeNanos;
+
+                    long elapsed = System.currentTimeMillis() - cursorMoveStartTime;
+                    float ramp = Math.min(1f, elapsed / (float) CURSOR_RAMP_DURATION_MS);
+                    float speed = cursorStep * (1f + ramp * (CURSOR_MAX_MULTIPLIER - 1f)) * deltaMultiplier;
+
+                    float x = cursorView.getCursorX();
+                    float y = cursorView.getCursorY();
+
+                    int viewHeight = cursorView.getHeight();
+                    if (viewHeight == 0) viewHeight = webView.getHeight();
+
+                    if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_UP)) {
+                        if (y - speed < 0) {
+                            webView.evaluateJavascript(
+                                    "(function(){return window.scrollY<=0;})();",
+                                    result -> {
+                                        if ("true".equals(result)) {
+                                            runOnUiThread(MainActivity.this::focusUrlBar);
+                                        } else {
+                                            webView.evaluateJavascript(
+                                                    "window.scrollBy(0,-" + scrollStep + ");",
+                                                    null
+                                            );
+                                        }
+                                    }
+                            );
+                        } else {
+                            y -= speed;
+                        }
+                    }
+                    if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_DOWN)) {
+                        if (y + speed > viewHeight) {
+                            webView.evaluateJavascript("window.scrollBy(0," + scrollStep + ");", null);
+                        } else {
+                            y += speed;
+                        }
+                    }
+                    if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_LEFT)) {
+                        x = Math.max(0, x - speed);
+                    }
+                    if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_RIGHT)) {
+                        x = Math.min(cursorView.getWidth(), x + speed);
+                    }
+
+                    cursorView.setCursorPositionFast(x, y);
+                    Choreographer.getInstance().postFrameCallback(this);
+                }
+            };
+
+    private void startCursorFrameLoopIfNeeded() {
+        if (!cursorFrameLoopRunning) {
+            cursorFrameLoopRunning = true;
+            cursorMoveStartTime = System.currentTimeMillis();
+            lastCursorFrameTimeNanos = 0L;
+            Choreographer.getInstance().postFrameCallback(cursorFrameCallback);
+        }
+    }
+
+    private void stopCursorFrameLoop() {
+        heldDirectionKeys.clear();
+        cursorFrameLoopRunning = false;
+        lastCursorFrameTimeNanos = 0L;
+        Choreographer.getInstance().removeFrameCallback(cursorFrameCallback);
+    }
+
+    // ---------- JS toggle ----------
+    private boolean loadJsSetting() {
+        return prefs().getBoolean(KEY_JS_ENABLED, true);
+    }
+
+    private void toggleJavaScript() {
+        javascriptEnabled = !javascriptEnabled;
+        prefs().edit().putBoolean(KEY_JS_ENABLED, javascriptEnabled).apply();
+        for (TabData tab : tabs) {
+            if (tab.view != null) {
+                tab.view.getSettings().setJavaScriptEnabled(javascriptEnabled);
+            }
+        }
+        webView.reload();
+        Toast.makeText(this, javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF", Toast.LENGTH_SHORT).show();
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -156,6 +325,8 @@ public class MainActivity extends AppCompatActivity {
         });
 
         loadSpeedSettings();
+        desktopModeEnabled = prefs().getBoolean(KEY_DESKTOP_MODE, false);
+        javascriptEnabled = loadJsSetting();
 
         addNewTab(getHomepage());
 
@@ -178,7 +349,7 @@ public class MainActivity extends AppCompatActivity {
         wv.setFocusable(true);
         wv.setFocusableInTouchMode(true);
 
-        wv.getSettings().setJavaScriptEnabled(true);
+        wv.getSettings().setJavaScriptEnabled(javascriptEnabled);
         wv.getSettings().setDomStorageEnabled(true);
         wv.getSettings().setUseWideViewPort(true);
         wv.getSettings().setLoadWithOverviewMode(true);
@@ -188,15 +359,15 @@ public class MainActivity extends AppCompatActivity {
         wv.getSettings().setAllowContentAccess(true);
         wv.getSettings().setMixedContentMode(
             android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        wv.getSettings().setUserAgentString(
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+        wv.getSettings().setUserAgentString(desktopModeEnabled ? DESKTOP_USER_AGENT : MOBILE_USER_AGENT);
         wv.setBackgroundColor(Color.BLACK);
         wv.getSettings().setSupportMultipleWindows(true);
         wv.getSettings().setJavaScriptCanOpenWindowsAutomatically(true);
         wv.getSettings().setBuiltInZoomControls(true);
         wv.getSettings().setDisplayZoomControls(false);
         wv.getSettings().setSupportZoom(true);
+
+        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true);
 
         TabData tab = new TabData();
         tab.view = wv;
@@ -260,6 +431,15 @@ public class MainActivity extends AppCompatActivity {
 
         wv.setWebViewClient(new WebViewClient() {
             @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                if (wv != webView) return;
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    view.evaluateJavascript(GM_SHIM_JS, null);
+                }
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 if (wv != webView) return;
@@ -271,8 +451,11 @@ public class MainActivity extends AppCompatActivity {
                     recordHistory(view.getTitle(), url);
                 }
 
-                injectAllUserscripts();
-                injectTabNavigationScript();
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    injectAllUserscripts();
+                }
+                injectTabNavigationScript();      // ensure it's there
+                reInjectTabNav();                 // extra safety
                 injectScrollWatcher();
                 stripTargetBlankLinks();
                 if (!cursorModeEnabled) {
@@ -291,8 +474,11 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        registerDocumentStartScripts(wv);
+
         wv.addJavascriptInterface(new KeyboardBridge(), "AndroidKeyboard");
         wv.addJavascriptInterface(new ChromeBridge(), "AndroidChrome");
+        wv.addJavascriptInterface(new GMXhrBridge(), "AndroidGMXhr");
         wv.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) -> {
             promptDownloadConfirmation(url, userAgent, contentDisposition, mimetype);
         });
@@ -326,6 +512,7 @@ public class MainActivity extends AppCompatActivity {
         if (index < 0 || index >= tabs.size()) return;
         TabData closed = tabs.remove(index);
         tabContainer.removeView(closed.view);
+        documentStartHandlers.remove(closed.view);
         closed.view.destroy();
 
         if (tabs.isEmpty()) {
@@ -376,11 +563,6 @@ public class MainActivity extends AppCompatActivity {
                 android.widget.LinearLayout row = new android.widget.LinearLayout(this);
                 row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
                 row.setPadding(12, 12, 12, 12);
-                // The row itself is NOT focusable. Only its two children
-                // (the select-tab label and the close button) are
-                // focusable, so D-pad LEFT/RIGHT can move between them
-                // instead of the row swallowing all focus and hiding the
-                // close button from the remote entirely.
                 final int normalBg = i == activeTabIndex ? Color.parseColor("#333333") : Color.TRANSPARENT;
                 row.setBackgroundColor(normalBg);
 
@@ -455,9 +637,6 @@ public class MainActivity extends AppCompatActivity {
                 .create();
         dialogHolder[0].show();
 
-        // Immediately focus the active tab's row (or the first row) once
-        // the dialog is shown, so the remote user has a visible starting
-        // point instead of no focus indicator at all.
         if (firstRowHolder[0] != null) {
             firstRowHolder[0].requestFocus();
         }
@@ -509,6 +688,93 @@ public class MainActivity extends AppCompatActivity {
         @android.webkit.JavascriptInterface
         public void onScrollUp() {
             runOnUiThread(MainActivity.this::showTopBar);
+        }
+    }
+
+    /**
+     * Native GM_xmlhttpRequest implementation.
+     */
+    private class GMXhrBridge {
+        @android.webkit.JavascriptInterface
+        public void request(final String requestId, final String detailsJson) {
+            new Thread(() -> {
+                String responseJson;
+                try {
+                    JSONObject details = new JSONObject(detailsJson);
+                    String method = details.optString("method", "GET");
+                    String urlStr = details.getString("url");
+                    int timeout = details.optInt("timeout", 15000);
+
+                    java.net.URL url = new java.net.URL(urlStr);
+                    java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod(method);
+                    conn.setConnectTimeout(timeout > 0 ? timeout : 15000);
+                    conn.setReadTimeout(timeout > 0 ? timeout : 15000);
+                    conn.setInstanceFollowRedirects(true);
+
+                    if (details.has("headers")) {
+                        JSONObject headers = details.getJSONObject("headers");
+                        java.util.Iterator<String> keys = headers.keys();
+                        while (keys.hasNext()) {
+                            String key = keys.next();
+                            try { conn.setRequestProperty(key, headers.getString(key)); } catch (Exception ignore) {}
+                        }
+                    }
+
+                    String data = details.optString("data", null);
+                    if (data != null && !data.isEmpty() && !"GET".equalsIgnoreCase(method)) {
+                        conn.setDoOutput(true);
+                        try (java.io.OutputStream os = conn.getOutputStream()) {
+                            os.write(data.getBytes("UTF-8"));
+                        }
+                    }
+
+                    int status = conn.getResponseCode();
+                    java.io.InputStream is;
+                    try {
+                        is = conn.getInputStream();
+                    } catch (Exception e) {
+                        is = conn.getErrorStream();
+                    }
+                    String responseText = "";
+                    if (is != null) {
+                        java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = is.read(buf)) != -1) buffer.write(buf, 0, n);
+                        is.close();
+                        responseText = buffer.toString("UTF-8");
+                    }
+
+                    JSONObject result = new JSONObject();
+                    result.put("status", status);
+                    result.put("statusText", "");
+                    result.put("responseText", responseText);
+                    result.put("response", responseText);
+                    result.put("ok", true);
+                    responseJson = result.toString();
+                } catch (Exception e) {
+                    JSONObject err = new JSONObject();
+                    try {
+                        err.put("ok", false);
+                        err.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
+                    } catch (JSONException ignore) {}
+                    responseJson = err.toString();
+                }
+
+                final String finalResponseJson = responseJson;
+                runOnUiThread(() -> {
+                    if (webView == null) return;
+                    String escaped = finalResponseJson
+                            .replace("\\", "\\\\")
+                            .replace("'", "\\'")
+                            .replace("\n", "\\n")
+                            .replace("\r", "\\r");
+                    webView.evaluateJavascript(
+                            "window.__gmXhrCallback && window.__gmXhrCallback('" + requestId + "', '" + escaped + "');",
+                            null);
+                });
+            }).start();
         }
     }
 
@@ -704,6 +970,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void toggleCursorMode() {
         cursorModeEnabled = !cursorModeEnabled;
+        if (!cursorModeEnabled) {
+            stopCursorFrameLoop();
+        }
         cursorModeButton.setText(cursorModeEnabled ? "Cursor: ON" : "Cursor: OFF");
         cursorView.setVisibility(cursorModeEnabled ? View.VISIBLE : View.GONE);
         if (!cursorModeEnabled) {
@@ -776,21 +1045,32 @@ public class MainActivity extends AppCompatActivity {
         webView.evaluateJavascript(js, null);
     }
 
+    private void reInjectTabNav() {
+        // Ensure the script is always present after navigation
+        injectTabNavigationScript();
+    }
+
     private void tabNavNext() {
+        if (webView == null) return;
         webView.evaluateJavascript(
             "window.__tvTabNav ? window.__tvTabNav.next() : 'inactive';",
             result -> {
-                if (result != null && result.contains("bottom")) {
-                    webView.evaluateJavascript("window.scrollBy(0, " + scrollStep + ");", null);
+                if (result == null) return;
+                if (result.contains("bottom") || result.contains("empty")) {
+                    // If at the last element or no elements, scroll down
+                    webView.evaluateJavascript("window.scrollBy(0," + scrollStep + ");", null);
                 }
             });
     }
 
     private void tabNavPrev() {
+        if (webView == null) return;
         webView.evaluateJavascript(
             "window.__tvTabNav ? window.__tvTabNav.prev() : 'inactive';",
             result -> {
-                if (result != null && result.contains("top")) {
+                if (result == null) return;
+                if (result.contains("top") || result.contains("empty")) {
+                    webView.evaluateJavascript("window.scrollBy(0,-" + scrollStep + ");", null);
                     runOnUiThread(this::focusUrlBar);
                 }
             });
@@ -914,14 +1194,106 @@ public class MainActivity extends AppCompatActivity {
         saveScripts(newArr);
     }
 
+    /**
+     * Registers the GM_ shim and every enabled userscript with the WebView's
+     * true "document-start" injection queue.
+     */
+    private void registerDocumentStartScripts(CustomWebView wv) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            Log.e("TVBrowser", "[AdBlockDiag] DOCUMENT_START_SCRIPT UNSUPPORTED on this WebView");
+            return;
+        }
+        Log.d("TVBrowser", "[AdBlockDiag] DOCUMENT_START_SCRIPT supported -- registering GM_ shim + userscripts");
+        java.util.List<androidx.webkit.ScriptHandler> existing = documentStartHandlers.get(wv);
+        if (existing != null) {
+            for (androidx.webkit.ScriptHandler handler : existing) {
+                try {
+                    handler.remove();
+                } catch (Exception e) {
+                    Log.e("TVBrowser", "ScriptHandler remove failed", e);
+                }
+            }
+        }
+        java.util.List<androidx.webkit.ScriptHandler> handlers = new ArrayList<>();
+        handlers.add(WebViewCompat.addDocumentStartJavaScript(wv, GM_SHIM_JS, java.util.Collections.singleton("*")));
+
+        JSONArray startupScripts = loadScripts();
+        for (int i = 0; i < startupScripts.length(); i++) {
+            try {
+                JSONObject obj = startupScripts.getJSONObject(i);
+                if (obj.optBoolean("enabled", true)) {
+                    String code = obj.getString("code");
+                    java.util.Set<String> originRules = parseMatchOriginRules(code);
+                    String scriptName = obj.optString("name", "unnamed");
+                    Log.d("TVBrowser", "[AdBlockDiag] Registering userscript '" + scriptName + "' with origin rules: " + originRules);
+                    String wrapped = "try{\n" + code + "\n}catch(e){console.error('Userscript error:',e && e.message ? e.message : e);}";
+                    handlers.add(WebViewCompat.addDocumentStartJavaScript(wv, wrapped, originRules));
+                }
+            } catch (JSONException e) {
+                Log.e("TVBrowser", "document-start inject failed", e);
+            }
+        }
+        documentStartHandlers.put(wv, handlers);
+    }
+
+    /**
+     * Parses @match origin rules.
+     */
+    private java.util.Set<String> parseMatchOriginRules(String scriptCode) {
+        java.util.Set<String> origins = new java.util.HashSet<>();
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("//\\s*@match\\s+(\\S+)")
+                    .matcher(scriptCode);
+            while (m.find()) {
+                String pattern = m.group(1);
+                String origin = matchPatternToOrigin(pattern);
+                if (origin != null) origins.add(origin);
+            }
+        } catch (Exception e) {
+            Log.e("TVBrowser", "parseMatchOriginRules failed", e);
+        }
+        if (origins.isEmpty()) {
+            origins.add("*");
+        }
+        return origins;
+    }
+
+    private String matchPatternToOrigin(String pattern) {
+        try {
+            int schemeEnd = pattern.indexOf("://");
+            if (schemeEnd < 0) return null;
+            String scheme = pattern.substring(0, schemeEnd);
+            String rest = pattern.substring(schemeEnd + 3);
+            int pathStart = rest.indexOf('/');
+            String hostPart = pathStart >= 0 ? rest.substring(0, pathStart) : rest;
+            if (hostPart.isEmpty() || hostPart.equals("*")) return "*";
+            return scheme + "://" + hostPart;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Re-registers document-start scripts on every currently open tab. */
+    private void refreshDocumentStartScriptsOnAllTabs() {
+        for (TabData tab : tabs) {
+            if (tab.view != null) {
+                registerDocumentStartScripts(tab.view);
+            }
+        }
+    }
+
     private void injectAllUserscripts() {
+        webView.evaluateJavascript(GM_SHIM_JS, null);
+
         JSONArray arr = loadScripts();
         for (int i = 0; i < arr.length(); i++) {
             try {
                 JSONObject obj = arr.getJSONObject(i);
                 if (obj.optBoolean("enabled", true)) {
                     String code = obj.getString("code");
-                    webView.evaluateJavascript(code, null);
+                    String wrapped = "try{\n" + code + "\n}catch(e){console.error('Userscript error:',e && e.message ? e.message : e);}";
+                    webView.evaluateJavascript(wrapped, null);
                 }
             } catch (JSONException e) {
                 Log.e("TVBrowser", "inject failed", e);
@@ -938,6 +1310,7 @@ public class MainActivity extends AppCompatActivity {
                 .setMessage(url)
                 .setPositiveButton("Install", (dialog, which) -> {
                     addScript(defaultName, url, pendingJsContent);
+                    refreshDocumentStartScriptsOnAllTabs();
                     pendingJsUrl = null;
                     pendingJsContent = null;
                     showTopBar();
@@ -1042,17 +1415,8 @@ public class MainActivity extends AppCompatActivity {
         bookmarkStarButton.setText(isBookmarked ? "\u2605" : "\u2606");
     }
 
-        /**
-     * Uses Android's system DownloadManager to fetch the file into a
-     * dedicated PanGalacticMonkey folder under the public Downloads
-     * directory, and records it in SharedPreferences so it can be
-     * managed later (install / open, delete, or dismiss) from the
-     * Downloads screen.
-     */
-    /**
-     * Asks the user for confirmation before downloading anything,
-     * showing the file name so they know what they are about to save.
-     */
+    // ---------------- Downloads ----------------
+
     private void promptDownloadConfirmation(String url, String userAgent, String contentDisposition, String mimetype) {
         final String finalFileName = extractFileName(url, contentDisposition, mimetype);
 
@@ -1065,13 +1429,6 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    /**
-     * Determines the real file name for a download, preferring the
-     * actual extension present in the URL itself (e.g. ".apk", ".pdf")
-     * over Android's URLUtil.guessFileName, which frequently mislabels
-     * files as generic ".bin" when the server's Content-Type header is
-     * missing or set to application/octet-stream.
-     */
     private String extractFileName(String url, String contentDisposition, String mimetype) {
         try {
             if (contentDisposition != null) {
@@ -1097,26 +1454,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Returns the list of available download base locations: Internal
-     * Storage (the standard public Downloads folder) plus any detected
-     * SD card / secondary storage volume, using Android's own
-     * getExternalFilesDirs() to discover real removable storage paths
-     * rather than guessing folder names.
-     */
-    /**
-     * IMPORTANT: getExternalFilesDirs() (previously used here to detect
-     * SD card paths) returns app-PRIVATE directories under
-     * Android/data/<package>/files on each storage volume. Those
-     * directories are sandboxed per-app on Android 10+ and cannot be
-     * read by other apps (MX Player, Xplore, etc.) under any
-     * circumstances -- writing downloads there is exactly what caused
-     * the "Open failed: permission denied" / EACCES errors, because the
-     * file itself was never actually shared storage in the first place.
-     * Only the public Downloads directory (and folders inside it) are
-     * guaranteed to be readable by other installed apps, so that's the
-     * only root offered now.
-     */
     private java.util.List<File> getAvailableStorageRoots() {
         java.util.List<File> roots = new java.util.ArrayList<>();
         roots.add(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS));
@@ -1126,11 +1463,6 @@ public class MainActivity extends AppCompatActivity {
     private File getDownloadBaseDir() {
         String saved = prefs().getString(KEY_DOWNLOAD_DIR, null);
         if (saved != null) {
-            // Safety net: if an earlier version of the app saved a
-            // sandboxed Android/data/... app-private path (from the old
-            // getExternalFilesDirs()-based SD card detection), silently
-            // fall back to public storage and clear the bad setting so
-            // future downloads are always readable by other apps.
             if (saved.contains("/Android/data/")) {
                 prefs().edit().remove(KEY_DOWNLOAD_DIR).apply();
             } else {
@@ -1147,12 +1479,6 @@ public class MainActivity extends AppCompatActivity {
         prefs().edit().putString(KEY_DOWNLOAD_DIR, path).apply();
     }
 
-    /**
-     * Lets the user choose where new downloads are saved: the default
-     * internal Downloads folder, a detected SD card / secondary storage
-     * volume (if present on the device), or a custom folder name typed
-     * in relative to internal storage.
-     */
     private void showChangeDownloadLocation() {
         java.util.List<File> roots = getAvailableStorageRoots();
         java.util.List<String> options = new java.util.ArrayList<>();
@@ -1238,13 +1564,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Polls the system DownloadManager in the background until the given
-     * download finishes (success or failure), then shows a follow-up
-     * dialog with the full file path and Install, Delete, and Done
-     * actions -- exactly like the main Downloads manager, but surfaced
-     * immediately for the file the user just downloaded.
-     */
     private void watchDownloadCompletion(long downloadId, String fileName, String fullPath) {
         final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
         final DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
@@ -1271,16 +1590,6 @@ public class MainActivity extends AppCompatActivity {
         handler.postDelayed(pollRunnable[0], 800);
     }
 
-    /**
-     * When DownloadManager writes to a custom destination via
-     * setDestinationUri() (used for our SD card / custom folder
-     * support), the resulting file is sometimes created as
-     * owner-only-readable (mode 600), which is why external apps like
-     * MX Player or Xplore report EACCES / "cannot play this link" even
-     * though the file downloaded successfully. This explicitly marks
-     * the file world-readable and triggers a media scan so external
-     * players and file managers can actually open it.
-     */
     private void makeFileReadableAndScan(String fullPath) {
         try {
             File file = new File(fullPath);
@@ -1303,10 +1612,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * The post-download confirmation dialog: shows the full file path
-     * and offers Install, Delete, and Done buttons.
-     */
     private void showDownloadCompleteDialog(String fileName, String fullPath, boolean success) {
         String message = fullPath;
         if (!success) {
@@ -1384,12 +1689,6 @@ public class MainActivity extends AppCompatActivity {
         saveDownloads(newArr);
     }
 
-    /**
-     * Checks the real Android DownloadManager status for every tracked
-     * download and refreshes each record's "status" field
-     * (downloading / complete / failed) before the Downloads dialog is
-     * displayed, so users always see up-to-date progress state.
-     */
     private void refreshDownloadStatuses() {
         JSONArray arr = loadDownloads();
         DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
@@ -1417,11 +1716,6 @@ public class MainActivity extends AppCompatActivity {
         saveDownloads(arr);
     }
 
-    /**
-     * Shows every tracked download with its full file path, current
-     * status, and Install/Open, Delete, and Done (dismiss from list)
-     * actions.
-     */
     private void showDownloadsManager() {
         refreshDownloadStatuses();
         JSONArray arr = loadDownloads();
@@ -1545,13 +1839,6 @@ public class MainActivity extends AppCompatActivity {
         return b;
     }
 
-    /**
-     * Opens a downloaded file with the appropriate system handler: APKs
-     * launch the package installer (prompting the user to allow
-     * install-from-unknown-sources the first time if needed), while
-     * everything else (video, images, PDFs, etc.) launches whatever app
-     * the user has installed capable of viewing that file type.
-     */
     private void openDownloadedFile(String path) {
         try {
             File file = new File(path);
@@ -1591,12 +1878,6 @@ public class MainActivity extends AppCompatActivity {
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 
-            // Some third-party players (MX Player, Xplore, etc.) resolve
-            // the receiving Activity via queryIntentActivities() and
-            // don't automatically inherit the URI grant unless it is
-            // explicitly extended to every matching app, which is why
-            // EACCES / "cannot play this link" errors happen even
-            // though the app declares FLAG_GRANT_READ_URI_PERMISSION.
             java.util.List<android.content.pm.ResolveInfo> resolvedApps =
                     getPackageManager().queryIntentActivities(intent, 0);
             for (android.content.pm.ResolveInfo resolveInfo : resolvedApps) {
@@ -1639,11 +1920,6 @@ public class MainActivity extends AppCompatActivity {
         prefs().edit().putString(KEY_HISTORY, arr.toString()).apply();
     }
 
-    /**
-     * Adds a visited page to the front of the history list, skipping
-     * duplicate consecutive entries for the same URL, and trims the
-     * list down to the most recent MAX_HISTORY_ITEMS entries.
-     */
     private void recordHistory(String title, String url) {
         if (url == null || url.isEmpty() || url.startsWith("about:") || url.startsWith("data:")) {
             return;
@@ -1689,10 +1965,6 @@ public class MainActivity extends AppCompatActivity {
         saveHistory(newArr);
     }
 
-    /**
-     * Shows the last visited pages (most recent first) with tap-to-open
-     * behavior, a per-item Delete button, and a Clear All button.
-     */
     private void showHistoryManager() {
         JSONArray arr = loadHistory();
         int count = arr.length();
@@ -1823,13 +2095,6 @@ public class MainActivity extends AppCompatActivity {
 
     // ---------------- Private Browsing ----------------
 
-    /**
-     * Toggles private browsing for the rest of the app session. While
-     * enabled, no new history entries are recorded and cookies plus all
-     * WebView storage are cleared both when entering private mode and
-     * again automatically when the app is closed, so nothing persists
-     * between private sessions.
-     */
     private void togglePrivateBrowsing() {
         privateBrowsingEnabled = !privateBrowsingEnabled;
         if (privateBrowsingEnabled) {
@@ -1845,7 +2110,29 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-private void showBookmarksMenu() {
+    private void toggleDesktopMode() {
+        desktopModeEnabled = !desktopModeEnabled;
+        prefs().edit().putBoolean(KEY_DESKTOP_MODE, desktopModeEnabled).apply();
+
+        String ua = desktopModeEnabled ? DESKTOP_USER_AGENT : MOBILE_USER_AGENT;
+        for (TabData tab : tabs) {
+            if (tab.view != null) {
+                tab.view.getSettings().setUserAgentString(ua);
+            }
+        }
+
+        if (webView != null) {
+            webView.reload();
+        }
+
+        Toast.makeText(this,
+                desktopModeEnabled ? "Requesting desktop site" : "Requesting mobile site",
+                Toast.LENGTH_SHORT).show();
+    }
+
+    // ---------------- Menu ---------------
+
+    private void showBookmarksMenu() {
         String[] options = {
             "View Bookmarks",
             "Add Current Page",
@@ -1854,9 +2141,11 @@ private void showBookmarksMenu() {
             "Change Download Location",
             "History",
             privateBrowsingEnabled ? "Private Browsing: ON" : "Private Browsing: OFF",
+            desktopModeEnabled ? "Request Desktop Site: ON" : "Request Desktop Site: OFF",
             "Zoom In",
             "Zoom Out",
-            "Cursor & Scroll Speed"
+            "Cursor & Scroll Speed",
+            javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF"
         };
 
         android.widget.LinearLayout container = new android.widget.LinearLayout(this);
@@ -1910,19 +2199,27 @@ private void showBookmarksMenu() {
                     togglePrivateBrowsing();
                     break;
                 case 7:
-                    zoomIn();
+                    toggleDesktopMode();
                     break;
                 case 8:
-                    zoomOut();
+                    zoomIn();
                     break;
                 case 9:
+                    zoomOut();
+                    break;
+                case 10:
                     showSpeedSettings();
+                    break;
+                case 11:
+                    toggleJavaScript();
                     break;
             }
         });
 
         dialog.show();
     }
+
+    // ---------------- Speed Settings ----------------
 
     private void showSpeedSettings() {
         android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
@@ -2105,6 +2402,7 @@ private void showBookmarksMenu() {
                 .setMessage(name)
                 .setPositiveButton("Remove", (d, w) -> {
                     removeScript(index);
+                    refreshDocumentStartScriptsOnAllTabs();
                     Toast.makeText(this, "Removed: " + name, Toast.LENGTH_SHORT).show();
                     webView.reload();
                 })
@@ -2121,6 +2419,8 @@ private void showBookmarksMenu() {
                 .replace("\\\"", "\"")
                 .replace("\\\\", "\\");
     }
+
+    // ---------------- Key Events ----------------
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
@@ -2188,11 +2488,7 @@ private void showBookmarksMenu() {
             return super.dispatchKeyEvent(event);
         }
 
-        // Long-press DPAD_CENTER/ENTER acts as a "right click": if the
-        // element under the cursor (or currently focused/highlighted
-        // element in tab-nav mode) is an image, holding the button down
-        // for LONG_PRESS_DELAY_MS prompts the user to save it. A quick
-        // tap still performs the normal click/activate behavior.
+        // Long-press DPAD_CENTER/ENTER
         if (event.getKeyCode() == KeyEvent.KEYCODE_DPAD_CENTER
                 || event.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
@@ -2220,10 +2516,11 @@ private void showBookmarksMenu() {
             }
         }
 
-        if (event.getAction() == KeyEvent.ACTION_DOWN) {
-            int keyCode = event.getKeyCode();
+        int keyCode = event.getKeyCode();
 
-            if (!cursorModeEnabled) {
+        // ---------- Tab Navigation Mode (Cursor OFF) ----------
+        if (!cursorModeEnabled) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
                 switch (keyCode) {
                     case KeyEvent.KEYCODE_DPAD_RIGHT:
                     case KeyEvent.KEYCODE_DPAD_DOWN:
@@ -2241,51 +2538,38 @@ private void showBookmarksMenu() {
                         return super.dispatchKeyEvent(event);
                 }
             }
+            return super.dispatchKeyEvent(event);
+        }
 
-            float x = cursorView.getCursorX();
-            float y = cursorView.getCursorY();
+        // ---------- Cursor Mode (ON) ----------
+        boolean isDirectionKey = keyCode == KeyEvent.KEYCODE_DPAD_UP
+                || keyCode == KeyEvent.KEYCODE_DPAD_DOWN
+                || keyCode == KeyEvent.KEYCODE_DPAD_LEFT
+                || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT;
 
+        if (isDirectionKey) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                if (heldDirectionKeys.isEmpty()) {
+                    cursorMoveStartTime = System.currentTimeMillis();
+                }
+                heldDirectionKeys.add(keyCode);
+                startCursorFrameLoopIfNeeded();
+            } else if (event.getAction() == KeyEvent.ACTION_UP) {
+                heldDirectionKeys.remove(keyCode);
+                if (heldDirectionKeys.isEmpty()) {
+                    lastCursorFrameTimeNanos = 0L;
+                }
+            }
+            return true;
+        }
+
+        // Other keys in cursor mode
+        if (event.getAction() == KeyEvent.ACTION_DOWN) {
             switch (keyCode) {
-                case KeyEvent.KEYCODE_DPAD_UP:
-                    if (y - cursorStep < 0) {
-                        webView.evaluateJavascript(
-                            "(function(){ return window.scrollY <= 0; })();",
-                            result -> {
-                                if ("true".equals(result)) {
-                                    runOnUiThread(this::focusUrlBar);
-                                } else {
-                                    webView.evaluateJavascript("window.scrollBy(0, -" + scrollStep + ");", null);
-                                }
-                            });
-                    } else {
-                        cursorView.setCursorPosition(x, y - cursorStep);
-                    }
-                    return true;
-
-                case KeyEvent.KEYCODE_DPAD_DOWN:
-                    int usableHeight = cursorView.getHeight();
-                    if (y + cursorStep > usableHeight) {
-                        webView.evaluateJavascript("window.scrollBy(0, " + scrollStep + ");", null);
-                    } else {
-                        cursorView.setCursorPosition(x, y + cursorStep);
-                    }
-                    return true;
-
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                    cursorView.setCursorPosition(Math.max(0, x - cursorStep), y);
-                    return true;
-
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
-                    cursorView.setCursorPosition(Math.min(cursorView.getWidth(), x + cursorStep), y);
-                    return true;
-
                 case KeyEvent.KEYCODE_MENU:
                     showTopBar();
                     showBookmarksMenu();
                     return true;
-
-                default:
-                    break;
             }
         }
 
@@ -2334,6 +2618,8 @@ private void showBookmarksMenu() {
             imm.showSoftInput(urlBar, InputMethodManager.SHOW_IMPLICIT);
         }
     }
+
+    // ---------------- Click Simulation ----------------
 
     private void simulateClick(float x, float y) {
         int[] cursorLoc = new int[2];
@@ -2423,11 +2709,6 @@ private void showBookmarksMenu() {
 
     @Override
     protected void onDestroy() {
-        // If private browsing was active, make sure cookies, cache, and
-        // form data are wiped when the app closes so nothing carries
-        // over into the next session. Every new launch already starts
-        // fresh at the homepage via onCreate(), so this guarantees a
-        // private session leaves no trace once the app is exited.
         if (privateBrowsingEnabled) {
             android.webkit.CookieManager.getInstance().removeAllCookies(null);
             android.webkit.CookieManager.getInstance().setAcceptCookie(true);
@@ -2442,14 +2723,8 @@ private void showBookmarksMenu() {
         super.onDestroy();
     }
 
-    /**
-     * Checks whether the element currently under the on-screen cursor
-     * (or, in tab-nav/no-cursor mode, the currently highlighted/focused
-     * element) is an image, and if so, resolves its full image URL and
-     * routes it through the same download-confirmation flow used for
-     * regular file downloads -- effectively a "right click > save
-     * image" for the remote control.
-     */
+    // ---------------- Image Save (Long Press) ----------------
+
     private static final java.util.Set<String> SAVEABLE_EXTENSIONS = new java.util.HashSet<>(java.util.Arrays.asList(
         "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg",
         "mp4", "webm", "mkv", "mov", "avi", "3gp", "m4v",
@@ -2472,16 +2747,6 @@ private void showBookmarksMenu() {
         }
     }
 
-    /**
-     * Checks whether the element under the cursor (or, in tab-nav/no
-     * cursor mode, the currently focused/highlighted element) is a
-     * saveable media file -- image, video, audio, or a link pointing
-     * directly to one (pdf, zip, apk, doc, etc.) -- and if so routes it
-     * through the download-confirmation flow. Also handles the case
-     * where the current page itself IS the media file, which happens
-     * when the browser navigates directly to a raw file URL like a
-     * .mp4 or .png link with nothing else on the page.
-     */
     private void checkLongPressForImage() {
         String currentUrl = webView.getUrl();
         if (hasSaveableExtension(currentUrl)) {
