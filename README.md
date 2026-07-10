@@ -18,7 +18,7 @@ A remote‑friendly, full‑featured web browser built specifically for **Amazon
 
 The PanGalactic Monkey browser family now comes in **two editions**, each designed for different needs while sharing the same core experience.
 
-## 🐒 PanGalactic Monkey Slim (WebView Edition — ~3MB)
+## 🐒 PanGalactic Monkey Slim (WebView Edition ~3MB)
 The original lightweight browser — now officially named **Slim**.
 
 - Built on **Android WebView**
@@ -27,7 +27,7 @@ The original lightweight browser — now officially named **Slim**.
 - Universal compatibility across all Android devices
 - Ideal for users who want speed and minimal storage usage
 
-## 🦍 PanGalactic Monkey Chunky (GeckoView Edition — ~90MB)
+## 🦍 PanGalactic Monkey Chunky (GeckoView Edition ~90MB)
 The new heavyweight version — **Chunky** — powered by **GeckoView**.
 
 - Full **Firefox extension (.xpi)** support  
@@ -87,14 +87,14 @@ PanGalactic Monkey provides a complete TV‑optimized browsing experience across
 
 ## 📸 Long‑Press Save
 - Hold **OK** for ~0.5s  
-- Save images, videos, audio, PDFs, and direct file links  
-
-## 🔍 Zoom In / Out (Slim Only)
-- Quick access from the menu  
+- Save images, videos, audio, PDFs, and direct file links
 
 ## 🏠 Custom Homepage
 - One‑tap home button  
 - Fully configurable  
+
+## 🔍 Zoom In / Out (Slim Only)
+- Quick access from the menu  
 
 ## ⚙️ JavaScript Toggle (Slim Only)
 - JavaScript ON/OFF switch with persistent storage  
