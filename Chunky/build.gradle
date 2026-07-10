@@ -1,0 +1,19 @@
+// Top-level build file
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:9.2.1'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }               // Optional
+        maven { url 'https://maven.mozilla.org/maven2' }  // Required for GeckoView
+    }
+}

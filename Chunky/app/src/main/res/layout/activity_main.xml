@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:id="@+id/topBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:padding="0dp"
+            android:background="#242424"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/homeButton"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="@drawable/button_bg"
+                android:text="⌂"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp" />                
+
+            <EditText
+                android:id="@+id/urlBar"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:layout_marginStart="4dp"
+                android:layout_marginEnd="4dp"
+                android:background="#000000"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#888888"
+                android:textSize="14sp"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:singleLine="true"
+                android:imeOptions="actionGo"
+                android:inputType="textUri"
+                android:focusable="true"
+                android:focusableInTouchMode="true" />
+
+            <Button
+                android:id="@+id/bookmarkButton"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="@drawable/button_bg"
+                android:text="☆"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp" />
+
+            <Button
+                android:id="@+id/backButton"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="@drawable/button_bg"
+                android:text="◀"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp" />
+
+            <Button
+                android:id="@+id/forwardButton"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="@drawable/button_bg"
+                android:text="▶"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp" />  
+
+            <Button
+                android:id="@+id/goButton"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="@drawable/button_bg"
+                android:text="⟳"
+                android:textColor="#FFFFFF"
+                android:textSize="20sp"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp" />
+
+            <Button
+                android:id="@+id/cursorModeButton"
+                android:layout_width="wrap_content"
+                android:layout_height="44dp"
+                android:background="@drawable/button_bg"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp"
+                android:paddingStart="8dp"
+                android:paddingEnd="8dp"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:text="Cursor: ON" />
+
+            <Button
+                android:id="@+id/extensionsButton"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="@drawable/button_bg"
+                android:text="☰"
+                android:textColor="#FFFFFF"
+                android:textSize="18sp"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:minWidth="0dp"
+                android:minHeight="0dp"
+                android:padding="0dp" />
+
+        </LinearLayout>
+
+        <ProgressBar
+            android:id="@+id/progressBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="3dp"
+            android:progressTint="#00FF5E"
+            android:progressBackgroundTint="#242424"
+            android:max="100"
+            android:visibility="gone" />
+
+        <org.mozilla.geckoview.GeckoView
+            android:id="@+id/geckoView"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:focusable="true"
+            android:focusableInTouchMode="true" />
+    </LinearLayout>
+
+    <com.example.tvbrowser.CursorView
+        android:id="@+id/cursorView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+</FrameLayout>
