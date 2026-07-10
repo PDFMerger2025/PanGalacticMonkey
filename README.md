@@ -7,7 +7,7 @@
 ![Core](https://img.shields.io/badge/Core-WebView%20%7C%20GeckoView-1a1a2e?style=for-the-badge&logo=googlechrome&logoColor=white)
 </div>
 
-<img src="https://iili.io/C0Dfvgj.jpg" width="90%"/>
+<img src="https://iili.io/C0Dfvgj.jpg" width="100%"/>
 
 #  PanGalactic Monkey 👽🐵
 A remote‑friendly, full‑featured web browser built specifically for **Amazon Fire TV** and **Android TV**. No mouse. No keyboard. Just a remote — and the whole internet.
