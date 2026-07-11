@@ -39,11 +39,6 @@ The new heavyweight version — **Chunky** — powered by **GeckoView**.
 - Same familiar Monkey interface  
 - Requires correct 32‑bit or 64‑bit build (download both if unsure)
 
-### Missing (for now):
-- Cursor speed control
-- Zoom In/Out 
-- Built‑in adblock + userscript engines + user agent switcher + Javascript toggle (extensions replace these)
-
 ---
 
 # ✨ Unified Core Features (Slim + Chunky)
@@ -93,16 +88,16 @@ PanGalactic Monkey provides a complete TV‑optimized browsing experience across
 - One‑tap home button  
 - Fully configurable  
 
-## 🔍 Zoom In / Out (Slim Only)
+## 🔍 Zoom In / Out
 - Quick access from the menu  
 
-## ⚙️ JavaScript Toggle (Slim Only)
+## ⚙️ JavaScript Toggle
 - JavaScript ON/OFF switch with persistent storage  
 - Loads JS preference before first tab opens  
 - Tabs dynamically respect JS state  
 - New menu item: **JavaScript: ON/OFF**  
 
-## 🖥️ Request Desktop Site (Slim Only)
+## 🖥️ Request Desktop Site
 - Toggle desktop user‑agent mode  
 - Uses full desktop UA:  
   `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36`  
@@ -146,12 +141,8 @@ PanGalactic Monkey provides a complete TV‑optimized browsing experience across
 | Engine | WebView | GeckoView |
 | Size | ~3MB | ~90MB |
 | Extensions | ❌ None | ✅ Full Firefox (.xpi) |
-| Ad‑Block | ✔️ Built‑in (EasyList) | ❌ Use uBlock Origin extension |
-| Userscripts | ✔️ Built‑in | ❌ Use Standalone extension |
-| Cursor Speed Control | ✔️ Yes | ❌ Not yet |
-| Zoom In/Out | ✔️ Yes | ❌ Not yet |
-| Javacript Toggle | ✔️ Yes | ❌ Not yet |
-| Request Desktop Site | ✔️ Built‑in | ❌ Use Standalone extension |
+| Ad‑Block | ✅ Built‑in (EasyList) | ✔️ Use uBlock Origin extension |
+| Userscripts | ✅  Built‑in | ✔️ Use Standalone extension |
 | Performance | Fast & lightweight | Heavy but powerful |
 | Compatibility | Universal | Requires correct 32/64‑bit build |
 | Ideal For | Minimalist users | Power users / extension lovers |
@@ -191,7 +182,7 @@ PanGalactic Monkey provides a complete TV‑optimized browsing experience across
 
 <div align="center">
 
-`View Bookmarks` · `Add Current Page` · `Change Homepage` · `Downloads` · `Change Download Location` · `History` · `Private Browsing` · `Zoom In/Out (Slim Only)` · `Cursor & Scroll Speed (Slim Only)` · `JavaScript ON/OFF (Slim Only)` `Ad Block Filters (Slim Only)` · `Whitelist Current Site (Slim Only)` · `Manage Whitelist (Slim Only)` · `Extensions (Chunky Only)` ·
+`View Bookmarks` · `Add Current Page` · `Change Homepage` · `Downloads` · `Change Download Location` · `History` · `Private Browsing` · `Zoom In/Out` · `Cursor & Scroll Speed` · `JavaScript ON/OFF` `Ad Block Filters (Slim Only)` · `Whitelist Current Site (Slim Only)` · `Manage Whitelist (Slim Only)` · `Extensions (Chunky Only)` ·
 
 </div>
 
