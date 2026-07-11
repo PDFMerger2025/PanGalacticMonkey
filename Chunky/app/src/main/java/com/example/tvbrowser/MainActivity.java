@@ -1,5 +1,7 @@
 package com.example.tvbrowser;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
@@ -12,6 +14,7 @@ import android.os.SystemClock;
 import android.text.InputType;
 import android.util.Log;
 import android.view.Choreographer;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -40,6 +43,8 @@ import org.mozilla.geckoview.GeckoRuntime;
 import org.mozilla.geckoview.GeckoSession;
 import org.mozilla.geckoview.GeckoSessionSettings;
 import org.mozilla.geckoview.GeckoView;
+import org.mozilla.geckoview.PanZoomController;
+import org.mozilla.geckoview.ScreenLength;
 import org.mozilla.geckoview.WebExtension;
 import org.mozilla.geckoview.WebExtensionController;
 import org.mozilla.geckoview.WebResponse;
@@ -47,6 +52,8 @@ import org.mozilla.geckoview.WebResponse;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -67,12 +74,37 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_HISTORY = "history";
     private static final String KEY_DOWNLOADS = "downloads";
     private static final String KEY_BOOKMARKS = "bookmarks";
+    private static final String KEY_CURSOR_SPEED = "cursor_speed";
+    private static final String KEY_SCROLL_SPEED = "scroll_speed";
+    private static final String KEY_JS_ENABLED = "js_enabled";
+    private static final String KEY_DESKTOP_MODE = "desktop_mode";
+
+    private static final float DEFAULT_CURSOR_SPEED = 10f;
+    private static final float MIN_CURSOR_SPEED = 2f;
+    private static final float MAX_CURSOR_SPEED = 30f;
+
+    private static final float DEFAULT_SCROLL_SPEED = 605f;
+    private static final float MIN_SCROLL_SPEED = 5f;
+    private static final float MAX_SCROLL_SPEED = 100f;
+
+    private static final float DEFAULT_ZOOM = 1.0f;
+    private static final float MIN_ZOOM = 0.5f;
+    private static final float MAX_ZOOM = 3.0f;
+    private static final float ZOOM_STEP = 0.1f;
 
     private static final String[] EXTENSION_URLS = {
         "https://addons.mozilla.org/firefox/downloads/latest/darkreader/latest.xpi",
         "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi",
         null
     };
+
+    private static final Set<String> SAVEABLE_EXTENSIONS = new HashSet<>(java.util.Arrays.asList(
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg",
+        "mp4", "webm", "mkv", "mov", "avi", "3gp", "m4v",
+        "mp3", "wav", "ogg", "m4a", "flac", "aac",
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+        "zip", "rar", "7z", "apk", "txt"
+    ));
 
     private static GeckoRuntime sRuntime;
     private GeckoView geckoView;
@@ -98,13 +130,20 @@ public class MainActivity extends AppCompatActivity {
 
     private boolean cursorModeEnabled = true;
     private boolean topBarHasKeyFocus = false;
+    private boolean topBarVisible = true;
     private boolean privateBrowsingEnabled = false;
+
+    private float cursorSpeed = DEFAULT_CURSOR_SPEED;
+    private float scrollSpeed = DEFAULT_SCROLL_SPEED;
+    private boolean javascriptEnabled = true;
+    private boolean desktopModeEnabled = false;
 
     private static class TabData {
         GeckoSession session;
         String title = "";
         String url = "";
         boolean isPrivate = false;
+        float zoomLevel = DEFAULT_ZOOM;
     }
 
     private final List<TabData> tabs = new ArrayList<>();
@@ -115,15 +154,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private class CursorController {
-        static final float CURSOR_SPEED = 10f;
         static final float CURSOR_MAX_MULTIPLIER = 3.0f;
         static final long CURSOR_RAMP_DURATION_MS = 600L;
         static final float EDGE_SCROLL_THRESHOLD = 2f;
+        static final long SCROLL_DISPATCH_INTERVAL_MS = 40L;
 
         final GeckoView targetGeckoView;
         final CursorView targetCursorView;
         GeckoSession targetSession;
         boolean localCursorModeEnabled;
+        boolean isPopup = false;
 
         View topBarView = null;
         Runnable onReachTop = null;
@@ -133,6 +173,9 @@ public class MainActivity extends AppCompatActivity {
         long cursorMoveStartTime = 0L;
         long lastCursorFrameTimeNanos = 0L;
         boolean cursorFrameLoopRunning = false;
+
+        float pendingScrollDeltaY = 0f;
+        long lastScrollDispatchTime = 0L;
 
         final Handler centerLongPressHandler = new Handler(Looper.getMainLooper());
         Runnable centerLongPressRunnable;
@@ -157,7 +200,8 @@ public class MainActivity extends AppCompatActivity {
 
                 long elapsed = System.currentTimeMillis() - cursorMoveStartTime;
                 float ramp = Math.min(1f, elapsed / (float) CURSOR_RAMP_DURATION_MS);
-                float speed = CURSOR_SPEED * (1f + ramp * (CURSOR_MAX_MULTIPLIER - 1f)) * deltaMultiplier;
+                float speed = cursorSpeed * (1f + ramp * (CURSOR_MAX_MULTIPLIER - 1f)) * deltaMultiplier;
+                float edgeScrollAmount = scrollSpeed * deltaMultiplier;
 
                 float x = targetCursorView.getCursorX();
                 float y = targetCursorView.getCursorY();
@@ -166,20 +210,27 @@ public class MainActivity extends AppCompatActivity {
 
                 if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_UP)) {
                     if (y <= EDGE_SCROLL_THRESHOLD) {
-                        dispatchDragScroll(x, viewHeight / 2f, -speed);
+                        pendingScrollDeltaY -= edgeScrollAmount;
                     } else {
                         y = Math.max(0, y - speed);
                     }
                 }
                 if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_DOWN)) {
                     if (y >= viewHeight - EDGE_SCROLL_THRESHOLD) {
-                        dispatchDragScroll(x, viewHeight / 2f, speed);
+                        pendingScrollDeltaY += edgeScrollAmount;
                     } else {
                         y = Math.min(viewHeight, y + speed);
                     }
                 }
                 if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_LEFT)) x = Math.max(0, x - speed);
                 if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_RIGHT)) x = Math.min(viewWidth, x + speed);
+
+                long nowMs = System.currentTimeMillis();
+                if (pendingScrollDeltaY != 0f && nowMs - lastScrollDispatchTime >= SCROLL_DISPATCH_INTERVAL_MS) {
+                    scrollPage(0, pendingScrollDeltaY);
+                    pendingScrollDeltaY = 0f;
+                    lastScrollDispatchTime = nowMs;
+                }
 
                 targetCursorView.setCursorPositionFast(x, y);
                 Choreographer.getInstance().postFrameCallback(this);
@@ -202,6 +253,8 @@ public class MainActivity extends AppCompatActivity {
                 cursorFrameLoopRunning = true;
                 cursorMoveStartTime = System.currentTimeMillis();
                 lastCursorFrameTimeNanos = 0L;
+                pendingScrollDeltaY = 0f;
+                lastScrollDispatchTime = 0L;
                 Choreographer.getInstance().postFrameCallback(frameCallback);
             }
         }
@@ -210,6 +263,7 @@ public class MainActivity extends AppCompatActivity {
             heldDirectionKeys.clear();
             cursorFrameLoopRunning = false;
             lastCursorFrameTimeNanos = 0L;
+            pendingScrollDeltaY = 0f;
             Choreographer.getInstance().removeFrameCallback(frameCallback);
         }
 
@@ -226,29 +280,25 @@ public class MainActivity extends AppCompatActivity {
             targetGeckoView.requestFocus();
         }
 
-        void dispatchDragScroll(float x, float y, float deltaY) {
-            long downTime = SystemClock.uptimeMillis();
-            MotionEvent down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0);
-            targetGeckoView.dispatchTouchEvent(down);
-
-            long moveTime = downTime + 16;
-            MotionEvent move = MotionEvent.obtain(downTime, moveTime, MotionEvent.ACTION_MOVE, x, y - deltaY, 0);
-            targetGeckoView.dispatchTouchEvent(move);
-
-            long upTime = moveTime + 16;
-            MotionEvent up = MotionEvent.obtain(downTime, upTime, MotionEvent.ACTION_UP, x, y - deltaY, 0);
-            targetGeckoView.dispatchTouchEvent(up);
-
-            down.recycle();
-            move.recycle();
-            up.recycle();
+        void scrollPage(float deltaX, float deltaY) {
+            if (targetSession == null) return;
+            targetSession.getPanZoomController().scrollBy(
+                    ScreenLength.fromPixels(deltaX),
+                    ScreenLength.fromPixels(deltaY));
+            if (!isPopup) {
+                if (deltaY > 0) {
+                    runOnUiThread(MainActivity.this::hideTopBar);
+                } else if (deltaY < 0) {
+                    runOnUiThread(MainActivity.this::showTopBar);
+                }
+            }
         }
 
         void tabNavNext() {
             GeckoJSBridge.evaluateJavascript(targetSession, "window.__tvTabNav ? window.__tvTabNav.next() : 'inactive';")
                     .then(result -> {
                         if ("bottom".equals(result) || "empty".equals(result)) {
-                            dispatchDragScroll(targetCursorView.getWidth() / 2f, targetCursorView.getHeight() / 2f, 300);
+                            scrollPage(0, 300);
                         }
                         return null;
                     });
@@ -260,7 +310,7 @@ public class MainActivity extends AppCompatActivity {
                         if ("top".equals(result) && onReachTop != null) {
                             runOnUiThread(onReachTop);
                         } else if ("empty".equals(result)) {
-                            dispatchDragScroll(targetCursorView.getWidth() / 2f, targetCursorView.getHeight() / 2f, -300);
+                            scrollPage(0, -300);
                         }
                         return null;
                     });
@@ -334,6 +384,74 @@ public class MainActivity extends AppCompatActivity {
             return false;
         }
 
+        void checkLongPressForElement() {
+            String currentUrl = (!isPopup && !tabs.isEmpty() && activeTabIndex >= 0) ? tabs.get(activeTabIndex).url : null;
+            if (currentUrl != null && hasSaveableExtension(currentUrl)) {
+                offerSaveForUrl(currentUrl);
+                return;
+            }
+
+            String js;
+            if (localCursorModeEnabled) {
+                int[] cursorLoc = new int[2];
+                targetCursorView.getLocationOnScreen(cursorLoc);
+                float screenX = cursorLoc[0] + targetCursorView.getCursorX();
+                float screenY = cursorLoc[1] + targetCursorView.getCursorY();
+
+                int[] geckoLoc = new int[2];
+                targetGeckoView.getLocationOnScreen(geckoLoc);
+                float localX = screenX - geckoLoc[0];
+                float localY = screenY - geckoLoc[1];
+
+                js = "(function(){" +
+                    "  var ratio = window.devicePixelRatio || 1;" +
+                    "  var cssX = " + localX + " / ratio;" +
+                    "  var cssY = " + localY + " / ratio;" +
+                    "  var el = document.elementFromPoint(cssX, cssY);" +
+                    "  return el ? __tvResolveElement(el) : '';" +
+                    "})()";
+            } else {
+                js = "(function(){" +
+                    "  var el = document.activeElement;" +
+                    "  return el ? __tvResolveElement(el) : '';" +
+                    "})()";
+            }
+
+            String helper =
+                "window.__tvResolveElement = window.__tvResolveElement || function(el){" +
+                "  var cur = el;" +
+                "  for (var depth = 0; cur && depth < 4; depth++, cur = cur.parentElement) {" +
+                "    if (cur.tagName === 'IMG' && cur.src) return 'img|' + cur.src;" +
+                "    if ((cur.tagName === 'VIDEO' || cur.tagName === 'AUDIO')) {" +
+                "      var src = cur.currentSrc || cur.src || (cur.querySelector('source[src]') ? cur.querySelector('source[src]').src : '');" +
+                "      if (src) return 'media|' + src;" +
+                "    }" +
+                "    if (cur.tagName === 'A' && cur.href) return 'link|' + cur.href + '|' + (cur.innerText || cur.textContent || '');" +
+                "    var bg = window.getComputedStyle(cur).backgroundImage;" +
+                "    var m = bg && bg.match(/url\\(['\"]?(.*?)['\"]?\\)/);" +
+                "    if (m && m[1]) return 'img|' + m[1];" +
+                "  }" +
+                "  return '';" +
+                "};";
+
+            GeckoJSBridge.evaluateJavascript(targetSession, helper + js).then(result -> {
+                if (result == null) return null;
+                String data = result.toString();
+                if (data.isEmpty()) return null;
+                String[] parts = data.split("\\|", -1);
+                if (parts.length < 2) return null;
+                String type = parts[0];
+                String url = parts[1];
+                if (type.equals("link")) {
+                    String linkText = parts.length > 2 ? parts[2] : "";
+                    runOnUiThread(() -> showLinkPopup(url, linkText));
+                } else if (type.equals("img") || type.equals("media")) {
+                    runOnUiThread(() -> offerSaveForUrl(url));
+                }
+                return null;
+            });
+        }
+
         boolean handleKeyEvent(KeyEvent event) {
             int keyCode = event.getKeyCode();
 
@@ -341,7 +459,10 @@ public class MainActivity extends AppCompatActivity {
                 if (event.getAction() == KeyEvent.ACTION_DOWN) {
                     if (event.getRepeatCount() == 0) {
                         centerLongPressTriggered = false;
-                        centerLongPressRunnable = () -> centerLongPressTriggered = true;
+                        centerLongPressRunnable = () -> {
+                            centerLongPressTriggered = true;
+                            checkLongPressForElement();
+                        };
                         centerLongPressHandler.postDelayed(centerLongPressRunnable, LONG_PRESS_DELAY_MS);
                     }
                     return true;
@@ -417,6 +538,11 @@ public class MainActivity extends AppCompatActivity {
         topBar = findViewById(R.id.topBar);
         cursorView = findViewById(R.id.cursorView);
 
+        cursorSpeed = prefs().getFloat(KEY_CURSOR_SPEED, DEFAULT_CURSOR_SPEED);
+        scrollSpeed = prefs().getFloat(KEY_SCROLL_SPEED, DEFAULT_SCROLL_SPEED);
+        javascriptEnabled = prefs().getBoolean(KEY_JS_ENABLED, true);
+        desktopModeEnabled = prefs().getBoolean(KEY_DESKTOP_MODE, false);
+
         setupRuntime();
         addNewTab(getHomepage(), false);
         setupUiListeners();
@@ -448,6 +574,24 @@ public class MainActivity extends AppCompatActivity {
         loadInstalledExtensions();
     }
 
+    // ---------- Top Bar Visibility ----------
+
+    private void showTopBar() {
+        if (topBarVisible) return;
+        topBarVisible = true;
+        topBar.setVisibility(View.VISIBLE);
+        topBar.setAlpha(0f);
+        topBar.animate().alpha(1f).setDuration(200).start();
+    }
+
+    private void hideTopBar() {
+        if (!topBarVisible || topBarHasKeyFocus) return;
+        topBarVisible = false;
+        topBar.animate().alpha(0f).setDuration(200)
+                .withEndAction(() -> topBar.setVisibility(View.GONE))
+                .start();
+    }
+
     // ---------- Tabs ----------
 
     private void addNewTab(String url, boolean isPrivate) {
@@ -457,6 +601,10 @@ public class MainActivity extends AppCompatActivity {
 
         GeckoSessionSettings settings = new GeckoSessionSettings.Builder()
                 .usePrivateMode(isPrivate)
+                .allowJavascript(javascriptEnabled)
+                .userAgentMode(desktopModeEnabled
+                        ? GeckoSessionSettings.USER_AGENT_MODE_DESKTOP
+                        : GeckoSessionSettings.USER_AGENT_MODE_MOBILE)
                 .build();
         GeckoSession newSession = new GeckoSession(settings);
         tab.session = newSession;
@@ -541,6 +689,8 @@ public class MainActivity extends AppCompatActivity {
                     runOnUiThread(() -> progressBar.setVisibility(View.GONE));
                 }
                 injectTabNavScript(session);
+                injectZoomLock(session);
+                applyZoom(tab);
                 if (isActiveTab(tab) && mainCursorController != null && !mainCursorController.localCursorModeEnabled) {
                     GeckoJSBridge.evaluateJavascriptNoResult(session,
                             "window.__tvTabNav && window.__tvTabNav.enable();");
@@ -574,6 +724,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void switchToTab(int index) {
         if (index < 0 || index >= tabs.size()) return;
+        showTopBar();
 
         if (activeTabIndex >= 0 && activeTabIndex < tabs.size()) {
             sRuntime.getWebExtensionController().setTabActive(tabs.get(activeTabIndex).session, false);
@@ -590,6 +741,7 @@ public class MainActivity extends AppCompatActivity {
             mainCursorController = new CursorController(geckoView, cursorView, tab.session, cursorModeEnabled);
             mainCursorController.topBarView = topBar;
             mainCursorController.onReachTop = () -> {
+                showTopBar();
                 hideKeyboard();
                 topBarHasKeyFocus = true;
                 backButton.requestFocus();
@@ -758,6 +910,16 @@ public class MainActivity extends AppCompatActivity {
         GeckoJSBridge.evaluateJavascriptNoResult(session, js);
     }
 
+    private void injectZoomLock(GeckoSession session) {
+        String js = "(function(){" +
+            "var meta = document.querySelector('meta[name=viewport]');" +
+            "if (!meta) { meta = document.createElement('meta'); meta.name='viewport'; document.head.appendChild(meta); }" +
+            "meta.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no';" +
+            "document.documentElement.style.touchAction = 'pan-x pan-y';" +
+            "})();";
+        GeckoJSBridge.evaluateJavascriptNoResult(session, js);
+    }
+
     private void setupUiListeners() {
         goButton.setOnClickListener(v -> { if (!tabs.isEmpty()) tabs.get(activeTabIndex).session.reload(); });
         homeButton.setOnClickListener(v -> { if (!tabs.isEmpty()) tabs.get(activeTabIndex).session.loadUri(getHomepage()); });
@@ -834,6 +996,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void focusUrlBar() {
+        showTopBar();
         urlBar.requestFocus();
         urlBar.selectAll();
         InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
@@ -862,9 +1025,17 @@ public class MainActivity extends AppCompatActivity {
             "Bookmarks",
             "History",
             "Downloads",
+            "Zoom In",
+            "Zoom Out",
+            "Reset Zoom",
+            "Cursor Speed",
+            "Scroll Speed",
+            javascriptEnabled ? "JavaScript: ON (tap to disable)" : "JavaScript: OFF (tap to enable)",
+            desktopModeEnabled ? "Desktop Site: ON (tap to disable)" : "Desktop Site: OFF (tap to enable)",
             privateBrowsingEnabled ? "Private Browsing: ON (tap to disable)" : "Private Browsing: OFF (tap to enable)",
             "Change Homepage",
-            "Extensions"
+            "Extensions",
+            "Created by burnSYMBOL.com"
         };
         new AlertDialog.Builder(this)
                 .setTitle("Menu")
@@ -874,13 +1045,274 @@ public class MainActivity extends AppCompatActivity {
                         case 1: showBookmarksList(); break;
                         case 2: showHistoryManager(); break;
                         case 3: showDownloadsManager(); break;
-                        case 4: togglePrivateBrowsing(); break;
-                        case 5: promptChangeHomepage(); break;
-                        case 6: promptInstallExtension(); break;
+                        case 4: zoomIn(); break;
+                        case 5: zoomOut(); break;
+                        case 6: resetZoom(); break;
+                        case 7: showCursorSpeedDialog(); break;
+                        case 8: showScrollSpeedDialog(); break;
+                        case 9: toggleJavaScript(); break;
+                        case 10: toggleDesktopMode(); break;
+                        case 11: togglePrivateBrowsing(); break;
+                        case 12: promptChangeHomepage(); break;
+                        case 13: promptInstallExtension(); break;
+                        case 14: openBurnSymbolWebsite(); break;
                     }
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
+    }
+
+    private void openBurnSymbolWebsite() {
+        if (tabs.isEmpty()) return;
+        tabs.get(activeTabIndex).session.loadUri("https://burnsymbol.com");
+    }
+
+    // ---------- JavaScript Toggle ----------
+
+    private void toggleJavaScript() {
+        javascriptEnabled = !javascriptEnabled;
+        prefs().edit().putBoolean(KEY_JS_ENABLED, javascriptEnabled).apply();
+        for (TabData tab : tabs) {
+            if (tab.session != null) {
+                tab.session.getSettings().setAllowJavascript(javascriptEnabled);
+            }
+        }
+        if (!tabs.isEmpty()) {
+            tabs.get(activeTabIndex).session.reload();
+        }
+        Toast.makeText(this, javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF", Toast.LENGTH_SHORT).show();
+    }
+
+    // ---------- Desktop Site Toggle ----------
+
+    private void toggleDesktopMode() {
+        desktopModeEnabled = !desktopModeEnabled;
+        prefs().edit().putBoolean(KEY_DESKTOP_MODE, desktopModeEnabled).apply();
+
+        int uaMode = desktopModeEnabled
+                ? GeckoSessionSettings.USER_AGENT_MODE_DESKTOP
+                : GeckoSessionSettings.USER_AGENT_MODE_MOBILE;
+
+        for (TabData tab : tabs) {
+            if (tab.session != null) {
+                tab.session.getSettings().setUserAgentMode(uaMode);
+            }
+        }
+
+        if (!tabs.isEmpty()) {
+            tabs.get(activeTabIndex).session.reload();
+        }
+
+        Toast.makeText(this,
+                desktopModeEnabled ? "Requesting desktop site" : "Requesting mobile site",
+                Toast.LENGTH_SHORT).show();
+    }
+
+    // ---------- Zoom ----------
+
+    private void applyZoom(TabData tab) {
+        String js = "document.documentElement.style.zoom = '" + tab.zoomLevel + "';";
+        GeckoJSBridge.evaluateJavascriptNoResult(tab.session, js);
+    }
+
+    private void zoomIn() {
+        if (tabs.isEmpty()) return;
+        TabData tab = tabs.get(activeTabIndex);
+        tab.zoomLevel = Math.min(MAX_ZOOM, roundZoom(tab.zoomLevel + ZOOM_STEP));
+        applyZoom(tab);
+        Toast.makeText(this, "Zoom: " + Math.round(tab.zoomLevel * 100) + "%", Toast.LENGTH_SHORT).show();
+    }
+
+    private void zoomOut() {
+        if (tabs.isEmpty()) return;
+        TabData tab = tabs.get(activeTabIndex);
+        tab.zoomLevel = Math.max(MIN_ZOOM, roundZoom(tab.zoomLevel - ZOOM_STEP));
+        applyZoom(tab);
+        Toast.makeText(this, "Zoom: " + Math.round(tab.zoomLevel * 100) + "%", Toast.LENGTH_SHORT).show();
+    }
+
+    private void resetZoom() {
+        if (tabs.isEmpty()) return;
+        TabData tab = tabs.get(activeTabIndex);
+        tab.zoomLevel = DEFAULT_ZOOM;
+        applyZoom(tab);
+        Toast.makeText(this, "Zoom reset to 100%", Toast.LENGTH_SHORT).show();
+    }
+
+    private float roundZoom(float value) {
+        return Math.round(value * 100f) / 100f;
+    }
+
+    // ---------- Cursor Speed ----------
+
+    private void adjustCursorSpeed(float delta) {
+        cursorSpeed = Math.max(MIN_CURSOR_SPEED, Math.min(MAX_CURSOR_SPEED, cursorSpeed + delta));
+        prefs().edit().putFloat(KEY_CURSOR_SPEED, cursorSpeed).apply();
+    }
+
+    private void showCursorSpeedDialog() {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(32, 24, 32, 24);
+
+        TextView speedLabel = new TextView(this);
+        speedLabel.setTextColor(Color.WHITE);
+        speedLabel.setTextSize(18f);
+        speedLabel.setGravity(Gravity.CENTER);
+        container.addView(speedLabel);
+
+        TextView hint = new TextView(this);
+        hint.setText("Use D-Pad Left/Right or the buttons below to adjust");
+        hint.setTextColor(Color.parseColor("#AAAAAA"));
+        hint.setTextSize(12f);
+        hint.setGravity(Gravity.CENTER);
+        hint.setPadding(0, 4, 0, 16);
+        container.addView(hint);
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setGravity(Gravity.CENTER);
+
+        Button minusBtn = new Button(this);
+        minusBtn.setText("-1");
+        styleSpeedButton(minusBtn);
+
+        Button plusBtn = new Button(this);
+        plusBtn.setText("+1");
+        styleSpeedButton(plusBtn);
+
+        Runnable[] updateLabel = new Runnable[1];
+        updateLabel[0] = () -> speedLabel.setText("Cursor Speed: " + (int) cursorSpeed);
+        updateLabel[0].run();
+
+        minusBtn.setOnClickListener(v -> {
+            adjustCursorSpeed(-1f);
+            updateLabel[0].run();
+        });
+        plusBtn.setOnClickListener(v -> {
+            adjustCursorSpeed(1f);
+            updateLabel[0].run();
+        });
+
+        btnRow.addView(minusBtn);
+        btnRow.addView(plusBtn);
+        container.addView(btnRow);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Cursor Speed")
+                .setView(container)
+                .setNegativeButton("Close", null)
+                .create();
+
+        dialog.setOnKeyListener((d, keyCode, event) -> {
+            if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+            if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+                adjustCursorSpeed(-1f);
+                updateLabel[0].run();
+                return true;
+            } else if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                adjustCursorSpeed(1f);
+                updateLabel[0].run();
+                return true;
+            }
+            return false;
+        });
+
+        dialog.show();
+        minusBtn.requestFocus();
+    }
+
+    // ---------- Scroll Speed ----------
+
+    private void adjustScrollSpeed(float delta) {
+        scrollSpeed = Math.max(MIN_SCROLL_SPEED, Math.min(MAX_SCROLL_SPEED, scrollSpeed + delta));
+        prefs().edit().putFloat(KEY_SCROLL_SPEED, scrollSpeed).apply();
+    }
+
+    private void showScrollSpeedDialog() {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(32, 24, 32, 24);
+
+        TextView speedLabel = new TextView(this);
+        speedLabel.setTextColor(Color.WHITE);
+        speedLabel.setTextSize(18f);
+        speedLabel.setGravity(Gravity.CENTER);
+        container.addView(speedLabel);
+
+        TextView hint = new TextView(this);
+        hint.setText("Use D-Pad Left/Right or the buttons below to adjust");
+        hint.setTextColor(Color.parseColor("#AAAAAA"));
+        hint.setTextSize(12f);
+        hint.setGravity(Gravity.CENTER);
+        hint.setPadding(0, 4, 0, 16);
+        container.addView(hint);
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setGravity(Gravity.CENTER);
+
+        Button minusBtn = new Button(this);
+        minusBtn.setText("-5");
+        styleSpeedButton(minusBtn);
+
+        Button plusBtn = new Button(this);
+        plusBtn.setText("+5");
+        styleSpeedButton(plusBtn);
+
+        Runnable[] updateLabel = new Runnable[1];
+        updateLabel[0] = () -> speedLabel.setText("Scroll Speed: " + (int) scrollSpeed);
+        updateLabel[0].run();
+
+        minusBtn.setOnClickListener(v -> {
+            adjustScrollSpeed(-5f);
+            updateLabel[0].run();
+        });
+        plusBtn.setOnClickListener(v -> {
+            adjustScrollSpeed(5f);
+            updateLabel[0].run();
+        });
+
+        btnRow.addView(minusBtn);
+        btnRow.addView(plusBtn);
+        container.addView(btnRow);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Scroll Speed")
+                .setView(container)
+                .setNegativeButton("Close", null)
+                .create();
+
+        dialog.setOnKeyListener((d, keyCode, event) -> {
+            if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+            if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+                adjustScrollSpeed(-5f);
+                updateLabel[0].run();
+                return true;
+            } else if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                adjustScrollSpeed(5f);
+                updateLabel[0].run();
+                return true;
+            }
+            return false;
+        });
+
+        dialog.show();
+        minusBtn.requestFocus();
+    }
+
+    private void styleSpeedButton(Button b) {
+        b.setTextColor(Color.WHITE);
+        b.setBackgroundColor(Color.parseColor("#555555"));
+        b.setFocusable(true);
+        b.setOnFocusChangeListener((v, hasFocus) -> {
+            b.setBackgroundColor(Color.parseColor(hasFocus ? "#3DFF71" : "#555555"));
+            b.setTextColor(hasFocus ? Color.BLACK : Color.WHITE);
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        lp.setMargins(8, 0, 8, 0);
+        b.setLayoutParams(lp);
     }
 
     // ---------- Homepage ----------
@@ -1341,6 +1773,114 @@ public class MainActivity extends AppCompatActivity {
         }).start();
     }
 
+    // ---------- Long-press link popup ----------
+
+    private void showLinkPopup(String url, String text) {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Link");
+        String display = text.isEmpty() ? url : text + "\n" + url;
+        builder.setMessage(display);
+        builder.setPositiveButton("Copy Link", (d, w) -> copyToClipboard("Link", url));
+        builder.setNeutralButton("Save Target", (d, w) -> offerSaveForUrl(url));
+        builder.setNegativeButton("Close", null);
+        AlertDialog dialog = builder.create();
+        dialog.show();
+        requestDialogButtonFocus(dialog);
+    }
+
+    private void requestDialogButtonFocus(AlertDialog dialog) {
+        Button positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        if (positive != null) positive.requestFocus();
+    }
+
+    private void copyToClipboard(String label, String text) {
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm != null) {
+            cm.setPrimaryClip(ClipData.newPlainText(label, text));
+        }
+        Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show();
+    }
+
+    // ---------- Image/Media Save ----------
+
+    private boolean hasSaveableExtension(String url) {
+        if (url == null) return false;
+        try {
+            String path = Uri.parse(url).getLastPathSegment();
+            if (path == null || !path.contains(".")) return false;
+            String ext = path.substring(path.lastIndexOf('.') + 1).toLowerCase();
+            int q = ext.indexOf('?');
+            if (q >= 0) ext = ext.substring(0, q);
+            return SAVEABLE_EXTENSIONS.contains(ext);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void offerSaveForUrl(String url) {
+        String guessedMime = "*/*";
+        String lower = url.toLowerCase();
+        if (lower.matches(".*\\.(png|jpe?g|gif|webp|bmp|svg)(\\?.*)?$")) guessedMime = "image/*";
+        else if (lower.matches(".*\\.(mp4|webm|mkv|mov|avi|3gp|m4v)(\\?.*)?$")) guessedMime = "video/*";
+        else if (lower.matches(".*\\.(mp3|wav|ogg|m4a|flac|aac)(\\?.*)?$")) guessedMime = "audio/*";
+        else if (lower.matches(".*\\.pdf(\\?.*)?$")) guessedMime = "application/pdf";
+
+        String fileName = extractFileName(url, null, guessedMime);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Save this file?")
+                .setMessage(fileName + "\n\n" + url)
+                .setPositiveButton("Save", (d, w) -> startUrlDownload(url, fileName))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void startUrlDownload(String url, String fileName) {
+        File baseDir = getDownloadBaseDir();
+        File destDir = new File(baseDir, "TVBrowser");
+        destDir.mkdirs();
+        File destFile = new File(destDir, fileName);
+        String fullPath = destFile.getAbsolutePath();
+
+        recordDownload(fileName, fullPath);
+        Toast.makeText(this, "Downloading: " + fileName, Toast.LENGTH_SHORT).show();
+
+        new Thread(() -> {
+            HttpURLConnection conn = null;
+            try {
+                URL u = new URL(url);
+                conn = (HttpURLConnection) u.openConnection();
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(15000);
+                conn.connect();
+
+                try (InputStream in = conn.getInputStream();
+                     FileOutputStream out = new FileOutputStream(destFile)) {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = in.read(buffer)) != -1) {
+                        out.write(buffer, 0, read);
+                    }
+                }
+
+                runOnUiThread(() -> {
+                    updateDownloadStatus(fullPath, "complete");
+                    Toast.makeText(this, "Saved: " + fileName, Toast.LENGTH_SHORT).show();
+                    android.media.MediaScannerConnection.scanFile(this, new String[]{fullPath}, null, null);
+                });
+            } catch (Exception e) {
+                Log.e("TVBrowser", "startUrlDownload failed", e);
+                runOnUiThread(() -> {
+                    updateDownloadStatus(fullPath, "failed");
+                    Toast.makeText(this, "Save failed: " + fileName, Toast.LENGTH_SHORT).show();
+                });
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }).start();
+    }
+
     private JSONArray loadDownloads() {
         String raw = prefs().getString(KEY_DOWNLOADS, "[]");
         try {
@@ -1616,6 +2156,7 @@ public class MainActivity extends AppCompatActivity {
 
         boolean startInCursorMode = cursorModeEnabled;
         CursorController popupController = new CursorController(popupGeckoView, popupCursorView, popupSession, startInCursorMode);
+        popupController.isPopup = true;
         popupController.extraHitTargets.add(closeButton);
         popupCursorView.setVisibility(startInCursorMode ? View.VISIBLE : View.GONE);
 
@@ -1623,6 +2164,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onPageStop(GeckoSession session, boolean success) {
                 injectTabNavScript(session);
+                injectZoomLock(session);
                 if (!popupController.localCursorModeEnabled) {
                     GeckoJSBridge.evaluateJavascriptNoResult(session,
                             "window.__tvTabNav && window.__tvTabNav.enable();");
