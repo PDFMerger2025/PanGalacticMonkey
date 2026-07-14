@@ -148,8 +148,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int MAX_HISTORY_ITEMS = 20;
     private static final String KEY_DOWNLOAD_DIR = "download_dir_uri";
     private static final String KEY_DESKTOP_MODE = "desktop_mode_enabled";
-    private static final float DEFAULT_CURSOR_SPEED = 8f;
-    private static final float DEFAULT_SCROLL_SPEED = 120f;
+    private static final float DEFAULT_CURSOR_SPEED = 10f;
+    private static final float DEFAULT_SCROLL_SPEED = 80f;
     private float scrollStep = DEFAULT_SCROLL_SPEED;
     private boolean privateBrowsingEnabled = false;
 
