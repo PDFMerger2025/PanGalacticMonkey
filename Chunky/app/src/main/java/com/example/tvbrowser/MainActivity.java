@@ -78,6 +78,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_SCROLL_SPEED = "scroll_speed";
     private static final String KEY_JS_ENABLED = "js_enabled";
     private static final String KEY_DESKTOP_MODE = "desktop_mode";
+    private static final String KEY_CURSOR_AUTO_HIDE = "cursor_auto_hide";
 
     private static final float DEFAULT_CURSOR_SPEED = 10f;
     private static final float MIN_CURSOR_SPEED = 2f;
@@ -138,6 +139,10 @@ public class MainActivity extends AppCompatActivity {
     private boolean javascriptEnabled = true;
     private boolean desktopModeEnabled = false;
 
+    // Auto-hide cursor
+    private boolean cursorAutoHideEnabled = true;
+    private static final long CURSOR_HIDE_DELAY_MS = 10000;
+
     private static class TabData {
         GeckoSession session;
         String title = "";
@@ -177,6 +182,9 @@ public class MainActivity extends AppCompatActivity {
         float pendingScrollDeltaY = 0f;
         long lastScrollDispatchTime = 0L;
 
+        private final Handler hideHandler = new Handler(Looper.getMainLooper());
+        private Runnable hideRunnable;
+
         final Handler centerLongPressHandler = new Handler(Looper.getMainLooper());
         Runnable centerLongPressRunnable;
         boolean centerLongPressTriggered = false;
@@ -208,11 +216,14 @@ public class MainActivity extends AppCompatActivity {
                 int viewWidth = targetCursorView.getWidth();
                 int viewHeight = targetCursorView.getHeight();
 
+                boolean moved = false;
+
                 if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_UP)) {
                     if (y <= EDGE_SCROLL_THRESHOLD) {
                         pendingScrollDeltaY -= edgeScrollAmount;
                     } else {
                         y = Math.max(0, y - speed);
+                        moved = true;
                     }
                 }
                 if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_DOWN)) {
@@ -220,10 +231,19 @@ public class MainActivity extends AppCompatActivity {
                         pendingScrollDeltaY += edgeScrollAmount;
                     } else {
                         y = Math.min(viewHeight, y + speed);
+                        moved = true;
                     }
                 }
-                if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_LEFT)) x = Math.max(0, x - speed);
-                if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_RIGHT)) x = Math.min(viewWidth, x + speed);
+                if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_LEFT)) {
+                    float newX = Math.max(0, x - speed);
+                    if (newX != x) moved = true;
+                    x = newX;
+                }
+                if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_RIGHT)) {
+                    float newX = Math.min(viewWidth, x + speed);
+                    if (newX != x) moved = true;
+                    x = newX;
+                }
 
                 long nowMs = System.currentTimeMillis();
                 if (pendingScrollDeltaY != 0f && nowMs - lastScrollDispatchTime >= SCROLL_DISPATCH_INTERVAL_MS) {
@@ -233,6 +253,11 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 targetCursorView.setCursorPositionFast(x, y);
+
+                if (moved) {
+                    resetAutoHideTimer();
+                }
+
                 Choreographer.getInstance().postFrameCallback(this);
             }
         };
@@ -267,14 +292,53 @@ public class MainActivity extends AppCompatActivity {
             Choreographer.getInstance().removeFrameCallback(frameCallback);
         }
 
+        // ---------- Auto-hide ----------
+        private void resetAutoHideTimer() {
+            if (!cursorAutoHideEnabled || !localCursorModeEnabled) return;
+            cancelAutoHideTimer();
+            showCursor();
+            hideRunnable = () -> {
+                if (cursorAutoHideEnabled && localCursorModeEnabled) {
+                    targetCursorView.setVisibility(View.INVISIBLE);
+                }
+            };
+            hideHandler.postDelayed(hideRunnable, CURSOR_HIDE_DELAY_MS);
+        }
+
+        private void cancelAutoHideTimer() {
+            if (hideRunnable != null) {
+                hideHandler.removeCallbacks(hideRunnable);
+                hideRunnable = null;
+            }
+        }
+
+        private void showCursor() {
+            if (targetCursorView.getVisibility() != View.VISIBLE) {
+                targetCursorView.setVisibility(View.VISIBLE);
+            }
+        }
+
+        void onAutoHideToggled(boolean enabled) {
+            cursorAutoHideEnabled = enabled;
+            if (enabled && localCursorModeEnabled) {
+                resetAutoHideTimer();
+            } else {
+                cancelAutoHideTimer();
+                showCursor();
+            }
+        }
+
+        // ---------- Navigation ----------
         void toggleCursorMode() {
             localCursorModeEnabled = !localCursorModeEnabled;
             targetCursorView.setVisibility(localCursorModeEnabled ? View.VISIBLE : View.GONE);
             if (localCursorModeEnabled) {
                 GeckoJSBridge.evaluateJavascriptNoResult(targetSession, "window.__tvTabNav && window.__tvTabNav.disable();");
                 stopFrameLoop();
+                if (cursorAutoHideEnabled) resetAutoHideTimer();
             } else {
                 stopFrameLoop();
+                cancelAutoHideTimer();
                 GeckoJSBridge.evaluateJavascriptNoResult(targetSession, "window.__tvTabNav && window.__tvTabNav.enable();");
             }
             targetGeckoView.requestFocus();
@@ -507,6 +571,7 @@ public class MainActivity extends AppCompatActivity {
                     if (heldDirectionKeys.isEmpty()) cursorMoveStartTime = System.currentTimeMillis();
                     heldDirectionKeys.add(keyCode);
                     startFrameLoopIfNeeded();
+                    resetAutoHideTimer();
                 } else if (event.getAction() == KeyEvent.ACTION_UP) {
                     heldDirectionKeys.remove(keyCode);
                     if (heldDirectionKeys.isEmpty()) stopFrameLoop();
@@ -542,6 +607,7 @@ public class MainActivity extends AppCompatActivity {
         scrollSpeed = prefs().getFloat(KEY_SCROLL_SPEED, DEFAULT_SCROLL_SPEED);
         javascriptEnabled = prefs().getBoolean(KEY_JS_ENABLED, true);
         desktopModeEnabled = prefs().getBoolean(KEY_DESKTOP_MODE, false);
+        cursorAutoHideEnabled = prefs().getBoolean(KEY_CURSOR_AUTO_HIDE, true);
 
         setupRuntime();
         addNewTab(getHomepage(), false);
@@ -575,7 +641,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Top Bar Visibility ----------
-
     private void showTopBar() {
         if (topBarVisible) return;
         topBarVisible = true;
@@ -614,8 +679,8 @@ public class MainActivity extends AppCompatActivity {
 
         newSession.open(sRuntime);
         tabs.add(tab);
-        switchToTab(tabs.size() - 1);
-        newSession.loadUri(url);
+        switchToTab(tabs.size() - 1); // attach to view before loading
+        newSession.loadUri(url);      // load after attachment
     }
 
     private void attachDelegatesToTab(TabData tab) {
@@ -746,8 +811,12 @@ public class MainActivity extends AppCompatActivity {
                 topBarHasKeyFocus = true;
                 backButton.requestFocus();
             };
+            mainCursorController.onAutoHideToggled(cursorAutoHideEnabled);
         } else {
             mainCursorController.setSession(tab.session);
+            if (cursorAutoHideEnabled && cursorModeEnabled) {
+                mainCursorController.resetAutoHideTimer();
+            }
         }
 
         updateTabsButtonLabel();
@@ -774,9 +843,7 @@ public class MainActivity extends AppCompatActivity {
         updateTabsButtonLabel();
     }
 
-    private void updateTabsButtonLabel() {
-        // Reflected in the browser menu dialog title instead of a dedicated button.
-    }
+    private void updateTabsButtonLabel() { /* not used */ }
 
     private void showTabsSwitcher() {
         LinearLayout container = new LinearLayout(this);
@@ -1018,7 +1085,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Browser Menu ----------
-
     private void showBrowserMenu() {
         String[] items = {
             "Tabs (" + tabs.size() + ")",
@@ -1030,6 +1096,7 @@ public class MainActivity extends AppCompatActivity {
             "Reset Zoom",
             "Cursor Speed",
             "Scroll Speed",
+            cursorAutoHideEnabled ? "Auto‑Hide Cursor: ON" : "Auto‑Hide Cursor: OFF",
             javascriptEnabled ? "JavaScript: ON (tap to disable)" : "JavaScript: OFF (tap to enable)",
             desktopModeEnabled ? "Desktop Site: ON (tap to disable)" : "Desktop Site: OFF (tap to enable)",
             privateBrowsingEnabled ? "Private Browsing: ON (tap to disable)" : "Private Browsing: OFF (tap to enable)",
@@ -1050,12 +1117,13 @@ public class MainActivity extends AppCompatActivity {
                         case 6: resetZoom(); break;
                         case 7: showCursorSpeedDialog(); break;
                         case 8: showScrollSpeedDialog(); break;
-                        case 9: toggleJavaScript(); break;
-                        case 10: toggleDesktopMode(); break;
-                        case 11: togglePrivateBrowsing(); break;
-                        case 12: promptChangeHomepage(); break;
-                        case 13: promptInstallExtension(); break;
-                        case 14: openBurnSymbolWebsite(); break;
+                        case 9: toggleCursorAutoHide(); break;
+                        case 10: toggleJavaScript(); break;
+                        case 11: toggleDesktopMode(); break;
+                        case 12: togglePrivateBrowsing(); break;
+                        case 13: promptChangeHomepage(); break;
+                        case 14: promptInstallExtension(); break;
+                        case 15: openBurnSymbolWebsite(); break;
                     }
                 })
                 .setNegativeButton("Cancel", null)
@@ -1067,8 +1135,19 @@ public class MainActivity extends AppCompatActivity {
         tabs.get(activeTabIndex).session.loadUri("https://burnsymbol.com");
     }
 
-    // ---------- JavaScript Toggle ----------
+    // ---------- Auto-Hide Cursor Toggle ----------
+    private void toggleCursorAutoHide() {
+        cursorAutoHideEnabled = !cursorAutoHideEnabled;
+        prefs().edit().putBoolean(KEY_CURSOR_AUTO_HIDE, cursorAutoHideEnabled).apply();
+        if (mainCursorController != null) {
+            mainCursorController.onAutoHideToggled(cursorAutoHideEnabled);
+        }
+        Toast.makeText(this,
+                cursorAutoHideEnabled ? "Auto‑hide cursor: ON" : "Auto‑hide cursor: OFF",
+                Toast.LENGTH_SHORT).show();
+    }
 
+    // ---------- JavaScript Toggle ----------
     private void toggleJavaScript() {
         javascriptEnabled = !javascriptEnabled;
         prefs().edit().putBoolean(KEY_JS_ENABLED, javascriptEnabled).apply();
@@ -1084,7 +1163,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Desktop Site Toggle ----------
-
     private void toggleDesktopMode() {
         desktopModeEnabled = !desktopModeEnabled;
         prefs().edit().putBoolean(KEY_DESKTOP_MODE, desktopModeEnabled).apply();
@@ -1109,7 +1187,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Zoom ----------
-
     private void applyZoom(TabData tab) {
         String js = "document.documentElement.style.zoom = '" + tab.zoomLevel + "';";
         GeckoJSBridge.evaluateJavascriptNoResult(tab.session, js);
@@ -1144,7 +1221,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Cursor Speed ----------
-
     private void adjustCursorSpeed(float delta) {
         cursorSpeed = Math.max(MIN_CURSOR_SPEED, Math.min(MAX_CURSOR_SPEED, cursorSpeed + delta));
         prefs().edit().putFloat(KEY_CURSOR_SPEED, cursorSpeed).apply();
@@ -1223,7 +1299,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Scroll Speed ----------
-
     private void adjustScrollSpeed(float delta) {
         scrollSpeed = Math.max(MIN_SCROLL_SPEED, Math.min(MAX_SCROLL_SPEED, scrollSpeed + delta));
         prefs().edit().putFloat(KEY_SCROLL_SPEED, scrollSpeed).apply();
@@ -1316,7 +1391,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Homepage ----------
-
     private String getHomepage() {
         return prefs().getString(KEY_HOMEPAGE, DEFAULT_HOMEPAGE);
     }
@@ -1360,7 +1434,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Bookmarks ----------
-
     private JSONArray loadBookmarks() {
         String raw = prefs().getString(KEY_BOOKMARKS, "[]");
         try {
@@ -1502,7 +1575,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Private Browsing ----------
-
     private void togglePrivateBrowsing() {
         privateBrowsingEnabled = !privateBrowsingEnabled;
         Toast.makeText(this,
@@ -1513,7 +1585,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- History ----------
-
     private JSONArray loadHistory() {
         String raw = prefs().getString(KEY_HISTORY, "[]");
         try {
@@ -1691,7 +1762,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Downloads ----------
-
     private void promptDownloadConfirmation(WebResponse response) {
         String url = response.uri;
         Map<String, String> headers = response.headers;
@@ -1774,7 +1844,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Long-press link popup ----------
-
     private void showLinkPopup(String url, String text) {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle("Link");
@@ -1802,7 +1871,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Image/Media Save ----------
-
     private boolean hasSaveableExtension(String url) {
         if (url == null) return false;
         try {
@@ -2079,7 +2147,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ---------- Extensions ----------
-
     private void loadInstalledExtensions() {
         sRuntime.getWebExtensionController().list().accept(list -> {
             installedExtensions.clear();
@@ -2159,6 +2226,7 @@ public class MainActivity extends AppCompatActivity {
         popupController.isPopup = true;
         popupController.extraHitTargets.add(closeButton);
         popupCursorView.setVisibility(startInCursorMode ? View.VISIBLE : View.GONE);
+        popupController.onAutoHideToggled(cursorAutoHideEnabled);
 
         popupSession.setProgressDelegate(new GeckoSession.ProgressDelegate() {
             @Override
@@ -2176,6 +2244,7 @@ public class MainActivity extends AppCompatActivity {
                 .setView(container)
                 .setOnDismissListener(d -> {
                     popupController.stopFrameLoop();
+                    popupController.cancelAutoHideTimer();
                     popupSession.close();
                     if (!tabs.isEmpty()) {
                         sRuntime.getWebExtensionController().setTabActive(tabs.get(activeTabIndex).session, true);
@@ -2321,7 +2390,10 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
-        if (mainCursorController != null) mainCursorController.stopFrameLoop();
+        if (mainCursorController != null) {
+            mainCursorController.stopFrameLoop();
+            mainCursorController.cancelAutoHideTimer();
+        }
         for (TabData tab : tabs) {
             tab.session.close();
         }

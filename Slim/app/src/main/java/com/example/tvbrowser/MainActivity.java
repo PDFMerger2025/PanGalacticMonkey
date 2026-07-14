@@ -7,36 +7,38 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.database.Cursor;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
-import android.webkit.MimeTypeMap;
-import androidx.core.content.FileProvider;
-import java.io.File;
-import android.view.MotionEvent;
-import android.view.ViewGroup;
+import android.os.Handler;
+import android.provider.OpenableColumns;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.util.Log;
+import android.view.Choreographer;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.inputmethod.InputMethodManager;
-import android.widget.FrameLayout;
-import android.graphics.Color;
+import android.webkit.MimeTypeMap;
 import android.webkit.WebChromeClient;
-import android.webkit.WebChromeClient.CustomViewCallback;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
-import android.text.Editable;
-import android.text.TextWatcher;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.FileProvider;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
@@ -44,21 +46,16 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.HashSet;
-import java.util.Set;
-import android.view.Choreographer;
-
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
-
-// For local file picker
-import android.database.Cursor;
-import android.provider.OpenableColumns;
-import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -180,6 +177,13 @@ public class MainActivity extends AppCompatActivity {
     private static final long CURSOR_RAMP_DURATION_MS = 600L;
     private boolean cursorFrameLoopRunning = false;
 
+    // ---------- Cursor auto-hide ----------
+    private static final String KEY_CURSOR_AUTO_HIDE = "cursor_auto_hide";
+    private static final long CURSOR_HIDE_DELAY_MS = 10000; // 10 seconds
+    private boolean cursorAutoHideEnabled = true;
+    private final Handler cursorHideHandler = new Handler();
+    private Runnable cursorHideRunnable;
+
     private final Choreographer.FrameCallback cursorFrameCallback =
             new Choreographer.FrameCallback() {
                 @Override
@@ -216,6 +220,8 @@ public class MainActivity extends AppCompatActivity {
                     int viewHeight = cursorView.getHeight();
                     if (viewHeight == 0) viewHeight = webView.getHeight();
 
+                    boolean moved = false;
+
                     if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_UP)) {
                         if (y - speed < 0) {
                             webView.evaluateJavascript(
@@ -235,6 +241,7 @@ public class MainActivity extends AppCompatActivity {
                             );
                         } else {
                             y -= speed;
+                            moved = true;
                         }
                     }
                     if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_DOWN)) {
@@ -242,16 +249,25 @@ public class MainActivity extends AppCompatActivity {
                             webView.evaluateJavascript("window.scrollBy(0," + scrollStep + ");", null);
                         } else {
                             y += speed;
+                            moved = true;
                         }
                     }
                     if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_LEFT)) {
-                        x = Math.max(0, x - speed);
+                        float newX = Math.max(0, x - speed);
+                        if (newX != x) moved = true;
+                        x = newX;
                     }
                     if (heldDirectionKeys.contains(KeyEvent.KEYCODE_DPAD_RIGHT)) {
-                        x = Math.min(cursorView.getWidth(), x + speed);
+                        float newX = Math.min(cursorView.getWidth(), x + speed);
+                        if (newX != x) moved = true;
+                        x = newX;
                     }
 
-                    cursorView.setCursorPositionFast(x, y);
+                    if (moved) {
+                        cursorView.setCursorPositionFast(x, y);
+                        resetCursorHideTimer();
+                    }
+
                     Choreographer.getInstance().postFrameCallback(this);
                 }
             };
@@ -270,6 +286,45 @@ public class MainActivity extends AppCompatActivity {
         cursorFrameLoopRunning = false;
         lastCursorFrameTimeNanos = 0L;
         Choreographer.getInstance().removeFrameCallback(cursorFrameCallback);
+    }
+
+    private void resetCursorHideTimer() {
+        if (!cursorAutoHideEnabled || !cursorModeEnabled) return;
+        cancelCursorHideTimer();
+        showCursor();
+        cursorHideRunnable = () -> {
+            if (cursorAutoHideEnabled && cursorModeEnabled) {
+                cursorView.setVisibility(View.INVISIBLE);
+            }
+        };
+        cursorHideHandler.postDelayed(cursorHideRunnable, CURSOR_HIDE_DELAY_MS);
+    }
+
+    private void cancelCursorHideTimer() {
+        if (cursorHideRunnable != null) {
+            cursorHideHandler.removeCallbacks(cursorHideRunnable);
+            cursorHideRunnable = null;
+        }
+    }
+
+    private void showCursor() {
+        if (cursorView.getVisibility() != View.VISIBLE) {
+            cursorView.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void toggleCursorAutoHide() {
+        cursorAutoHideEnabled = !cursorAutoHideEnabled;
+        prefs().edit().putBoolean(KEY_CURSOR_AUTO_HIDE, cursorAutoHideEnabled).apply();
+        if (cursorAutoHideEnabled && cursorModeEnabled) {
+            resetCursorHideTimer();
+        } else {
+            cancelCursorHideTimer();
+            showCursor();
+        }
+        Toast.makeText(this,
+                cursorAutoHideEnabled ? "Auto‑hide cursor: ON" : "Auto‑hide cursor: OFF",
+                Toast.LENGTH_SHORT).show();
     }
 
     // ---------- JS toggle ----------
@@ -346,11 +401,15 @@ public class MainActivity extends AppCompatActivity {
         loadSpeedSettings();
         desktopModeEnabled = prefs().getBoolean(KEY_DESKTOP_MODE, false);
         javascriptEnabled = loadJsSetting();
+        cursorAutoHideEnabled = prefs().getBoolean(KEY_CURSOR_AUTO_HIDE, true);
 
         addNewTab(getHomepage());
 
         webView.post(() -> {
             cursorView.setCursorPosition(webView.getWidth() / 2f, webView.getHeight() / 2f);
+            if (cursorAutoHideEnabled && cursorModeEnabled) {
+                resetCursorHideTimer();
+            }
         });
     }
 
@@ -533,6 +592,9 @@ public class MainActivity extends AppCompatActivity {
         updateBookmarkStarIcon();
         updateTabsButtonLabel();
         webView.requestFocus();
+        if (cursorAutoHideEnabled && cursorModeEnabled) {
+            resetCursorHideTimer();
+        }
     }
 
     // ---------- closeTab ----------
@@ -994,6 +1056,13 @@ public class MainActivity extends AppCompatActivity {
         cursorModeEnabled = !cursorModeEnabled;
         if (!cursorModeEnabled) {
             stopCursorFrameLoop();
+            cancelCursorHideTimer();
+        } else {
+            if (cursorAutoHideEnabled) {
+                resetCursorHideTimer();
+            } else {
+                showCursor();
+            }
         }
         cursorModeButton.setText(cursorModeEnabled ? "Cursor: ON" : "Cursor: OFF");
         cursorView.setVisibility(cursorModeEnabled ? View.VISIBLE : View.GONE);
@@ -1216,7 +1285,6 @@ public class MainActivity extends AppCompatActivity {
         saveScripts(newArr);
     }
 
-    // ---------- Updated showScriptsManager ----------
     private void showScriptsManager() {
         JSONArray arr = loadScripts();
         int count = arr.length();
@@ -1563,9 +1631,13 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
+    /**
+     * Improved file name extraction that handles Google Images, favicon services, etc.
+     */
     private String extractFileName(String url, String contentDisposition, String mimetype) {
-        try {
-            if (contentDisposition != null) {
+        // 1. Try content-disposition
+        if (contentDisposition != null) {
+            try {
                 String cd = contentDisposition;
                 int fnIdx = cd.toLowerCase().indexOf("filename=");
                 if (fnIdx >= 0) {
@@ -1574,17 +1646,65 @@ public class MainActivity extends AppCompatActivity {
                     if (semi >= 0) name = name.substring(0, semi).trim();
                     if (!name.isEmpty()) return name;
                 }
-            }
+            } catch (Exception e) { /* ignore */ }
+        }
 
+        // 2. Handle Google favicon URLs (gstatic.com/faviconV2) – but now we rarely get them
+        try {
             Uri uri = Uri.parse(url);
-            String lastSegment = uri.getLastPathSegment();
+            String host = uri.getHost();
+            if (host != null && host.contains("gstatic.com") && uri.getPath() != null
+                    && uri.getPath().contains("faviconV2")) {
+                String siteUrl = uri.getQueryParameter("url");
+                if (siteUrl != null && !siteUrl.isEmpty()) {
+                    String domain = extractDomainFromUrl(siteUrl);
+                    if (domain != null && !domain.isEmpty()) {
+                        return "favicon_" + domain + ".png";
+                    }
+                }
+                return "favicon.png";
+            }
+        } catch (Exception e) { /* ignore */ }
+
+        // 3. If it's a Google Images result URL, extract the imgurl parameter
+        String realUrl = url;
+        try {
+            Uri uri = Uri.parse(url);
+            if (uri.getHost() != null && (uri.getHost().contains("google.com") || uri.getHost().contains("google."))) {
+                String imgurl = uri.getQueryParameter("imgurl");
+                if (imgurl != null && !imgurl.isEmpty()) {
+                    realUrl = imgurl;
+                }
+            }
+        } catch (Exception e) { /* ignore */ }
+
+        // 4. Try to get a file name from the real URL's path
+        try {
+            Uri realUri = Uri.parse(realUrl);
+            String lastSegment = realUri.getLastPathSegment();
             if (lastSegment != null && lastSegment.contains(".") && lastSegment.length() > 1) {
+                int q = lastSegment.indexOf('?');
+                if (q >= 0) lastSegment = lastSegment.substring(0, q);
                 return lastSegment;
             }
+        } catch (Exception e) { /* ignore */ }
 
-            return android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype);
+        // 5. Fallback to URLUtil.guessFileName
+        return android.webkit.URLUtil.guessFileName(realUrl, contentDisposition, mimetype);
+    }
+
+    /**
+     * Extract the domain (e.g., "example.com") from a URL.
+     */
+    private String extractDomainFromUrl(String url) {
+        try {
+            Uri uri = Uri.parse(url);
+            String host = uri.getHost();
+            if (host == null) return null;
+            if (host.startsWith("www.")) host = host.substring(4);
+            return host;
         } catch (Exception e) {
-            return "downloaded_file";
+            return null;
         }
     }
 
@@ -2276,6 +2396,7 @@ public class MainActivity extends AppCompatActivity {
             "Zoom In",
             "Zoom Out",
             "Cursor & Scroll Speed",
+            cursorAutoHideEnabled ? "Auto‑Hide Cursor: ON" : "Auto‑Hide Cursor: OFF",
             javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF",
             "Ad Block Filters",
             "Whitelist Current Site",
@@ -2322,10 +2443,11 @@ public class MainActivity extends AppCompatActivity {
                 case 8: zoomIn(); break;
                 case 9: zoomOut(); break;
                 case 10: showSpeedSettings(); break;
-                case 11: toggleJavaScript(); break;
-                case 12: showAdBlockManagerDialog(); break;
-                case 13: toggleWhitelistCurrentSite(); break;
-                case 14: showWhitelistManager(); break;
+                case 11: toggleCursorAutoHide(); break;
+                case 12: toggleJavaScript(); break;
+                case 13: showAdBlockManagerDialog(); break;
+                case 14: toggleWhitelistCurrentSite(); break;
+                case 15: showWhitelistManager(); break;
             }
         });
 
@@ -2865,8 +2987,26 @@ public class MainActivity extends AppCompatActivity {
         requestDialogButtonFocus(dialog);
     }
 
-    // ---------- Unified long-press ----------
+    // ---------- Unified long-press with improved favicon filtering ----------
     private void checkLongPressForElement() {
+        // First, try using WebView's HitTestResult
+        WebView.HitTestResult result = webView.getHitTestResult();
+        if (result != null) {
+            int type = result.getType();
+            String extra = result.getExtra();
+            if (extra != null && extra.startsWith("http") && !extra.contains("faviconV2") && !extra.contains("favicon")) {
+                if (type == WebView.HitTestResult.IMAGE_TYPE ||
+                    type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
+                    offerSaveForUrl(extra);
+                    return;
+                } else if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE) {
+                    showLinkPopup(extra, "");
+                    return;
+                }
+            }
+            // If it's a favicon, fall through to JavaScript
+        }
+
         String currentUrl = webView.getUrl();
         if (hasSaveableExtension(currentUrl)) {
             offerSaveForUrl(currentUrl);
@@ -2899,25 +3039,77 @@ public class MainActivity extends AppCompatActivity {
                 "})()";
         }
 
+        // Improved resolver: skips any URL containing "favicon", extracts img from anchors,
+        // and prioritises data-src, srcset, and Google imgurl.
         String helper =
             "window.__tvResolveElement = window.__tvResolveElement || function(el){" +
             "  var cur = el;" +
-            "  for (var depth = 0; cur && depth < 4; depth++, cur = cur.parentElement) {" +
-            "    if (cur.tagName === 'IMG' && cur.src) return 'img|' + cur.src;" +
-            "    if ((cur.tagName === 'VIDEO' || cur.tagName === 'AUDIO')) {" +
-            "      var src = cur.currentSrc || cur.src || (cur.querySelector('source[src]') ? cur.querySelector('source[src]').src : '');" +
-            "      if (src) return 'media|' + src;" +
+            "  for (var depth = 0; cur && depth < 5; depth++, cur = cur.parentElement) {" +
+            "    // IMG tags" +
+            "    if (cur.tagName === 'IMG') {" +
+            "      var src = cur.src;" +
+            "      var dataSrc = cur.dataset.src || cur.getAttribute('data-src') || cur.getAttribute('data-original') || cur.getAttribute('data-lazy-src');" +
+            "      if (dataSrc && dataSrc.startsWith('http')) src = dataSrc;" +
+            "      if (!src || src.startsWith('data:') || src.startsWith('blob:')) {" +
+            "        if (cur.srcset) {" +
+            "          var parts = cur.srcset.split(',');" +
+            "          var best = '', maxW = 0;" +
+            "          for (var i = 0; i < parts.length; i++) {" +
+            "            var entry = parts[i].trim().split(/\\s+/);" +
+            "            var url = entry[0];" +
+            "            var w = parseInt(entry[1]) || 0;" +
+            "            if (w > maxW) { maxW = w; best = url; }" +
+            "          }" +
+            "          if (best) src = best;" +
+            "        }" +
+            "      }" +
+            "      if (src && src.startsWith('http') && !src.includes('faviconV2') && !src.includes('favicon')) {" +
+            "        return 'img|' + src;" +
+            "      }" +
+            "      // if favicon, continue searching upward" +
+            "      continue;" +
             "    }" +
-            "    if (cur.tagName === 'A' && cur.href) return 'link|' + cur.href + '|' + (cur.innerText || cur.textContent || '');" +
+            "    // VIDEO / AUDIO" +
+            "    if (cur.tagName === 'VIDEO' || cur.tagName === 'AUDIO') {" +
+            "      var src = cur.currentSrc || cur.src || (cur.querySelector('source[src]') ? cur.querySelector('source[src]').src : '');" +
+            "      if (src && src.startsWith('http') && !src.includes('faviconV2') && !src.includes('favicon')) return 'media|' + src;" +
+            "    }" +
+            "    // LINK (anchor) – first look for an IMG inside, then fallback to href with imgurl extraction" +
+            "    if (cur.tagName === 'A' && cur.href) {" +
+            "      var href = cur.href;" +
+            "      // Check for Google imgurl" +
+            "      var match = href.match(/[?&]imgurl=([^&]+)/);" +
+            "      if (match) {" +
+            "        var realUrl = decodeURIComponent(match[1]);" +
+            "        if (realUrl.startsWith('http') && !realUrl.includes('faviconV2') && !realUrl.includes('favicon')) {" +
+            "          var ext = realUrl.split('.').pop().split('?')[0].toLowerCase();" +
+            "          if (['jpg','jpeg','png','gif','webp','bmp','svg'].indexOf(ext) !== -1) {" +
+            "            return 'img|' + realUrl;" +
+            "          }" +
+            "          return 'link|' + realUrl + '|' + (cur.innerText || cur.textContent || '');" +
+            "        }" +
+            "      }" +
+            "      // If href itself is a real image and not favicon" +
+            "      if (href.startsWith('http') && !href.includes('faviconV2') && !href.includes('favicon')) {" +
+            "        var ext2 = href.split('.').pop().split('?')[0].toLowerCase();" +
+            "        if (['jpg','jpeg','png','gif','webp','bmp','svg'].indexOf(ext2) !== -1) {" +
+            "          return 'img|' + href;" +
+            "        }" +
+            "        return 'link|' + href + '|' + (cur.innerText || cur.textContent || '');" +
+            "      }" +
+            "    }" +
+            "    // Background image" +
             "    var bg = window.getComputedStyle(cur).backgroundImage;" +
             "    var m = bg && bg.match(/url\\(['\"]?(.*?)['\"]?\\)/);" +
-            "    if (m && m[1]) return 'img|' + m[1];" +
+            "    if (m && m[1] && m[1].startsWith('http') && !m[1].includes('faviconV2') && !m[1].includes('favicon')) {" +
+            "      return 'img|' + m[1];" +
+            "    }" +
             "  }" +
             "  return '';" +
             "};";
 
-        webView.evaluateJavascript(helper + js, result -> {
-            String data = unescapeJson(result);
+        webView.evaluateJavascript(helper + js, resultStr -> {
+            String data = unescapeJson(resultStr);
             if (data == null || data.isEmpty()) return;
             String[] parts = data.split("\\|", -1);
             if (parts.length < 2) return;
@@ -3085,7 +3277,6 @@ public class MainActivity extends AppCompatActivity {
 
         if (isDirectionKey) {
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                // If url bar has focus, clear it immediately
                 if (urlBar.hasFocus()) {
                     runOnUiThread(() -> {
                         urlBar.clearFocus();
@@ -3098,6 +3289,7 @@ public class MainActivity extends AppCompatActivity {
                 }
                 heldDirectionKeys.add(keyCode);
                 startCursorFrameLoopIfNeeded();
+                resetCursorHideTimer();
             } else if (event.getAction() == KeyEvent.ACTION_UP) {
                 heldDirectionKeys.remove(keyCode);
                 if (heldDirectionKeys.isEmpty()) {
@@ -3107,7 +3299,6 @@ public class MainActivity extends AppCompatActivity {
             return true;
         }
 
-        // Other keys in cursor mode
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
             switch (keyCode) {
                 case KeyEvent.KEYCODE_MENU:
