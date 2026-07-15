@@ -1,11 +1,14 @@
 package com.example.tvbrowser;
 
+import android.Manifest;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -30,6 +33,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.FileProvider;
@@ -84,9 +88,9 @@ public class MainActivity extends AppCompatActivity {
     private static final float MIN_CURSOR_SPEED = 2f;
     private static final float MAX_CURSOR_SPEED = 30f;
 
-    private static final float DEFAULT_SCROLL_SPEED = 605f;
+    private static final float DEFAULT_SCROLL_SPEED = 40f;
     private static final float MIN_SCROLL_SPEED = 5f;
-    private static final float MAX_SCROLL_SPEED = 100f;
+    private static final float MAX_SCROLL_SPEED = 200f;
 
     private static final float DEFAULT_ZOOM = 1.0f;
     private static final float MIN_ZOOM = 0.5f;
@@ -139,9 +143,30 @@ public class MainActivity extends AppCompatActivity {
     private boolean javascriptEnabled = true;
     private boolean desktopModeEnabled = false;
 
-    // Auto-hide cursor
     private boolean cursorAutoHideEnabled = true;
     private static final long CURSOR_HIDE_DELAY_MS = 10000;
+
+    private boolean mIsDestroyed = false;
+
+    // Storage permission
+    private static final int REQUEST_CODE_STORAGE_PERMISSION = 1002;
+
+    private void checkStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Build.VERSION.SDK_INT < 33) {
+            if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{
+                        Manifest.permission.WRITE_EXTERNAL_STORAGE
+                }, REQUEST_CODE_STORAGE_PERMISSION);
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+    }
 
     private static class TabData {
         GeckoSession session;
@@ -192,6 +217,11 @@ public class MainActivity extends AppCompatActivity {
         final Choreographer.FrameCallback frameCallback = new Choreographer.FrameCallback() {
             @Override
             public void doFrame(long frameTimeNanos) {
+                if (mIsDestroyed) {
+                    stopFrameLoop();
+                    return;
+                }
+
                 if (heldDirectionKeys.isEmpty() || !localCursorModeEnabled) {
                     cursorFrameLoopRunning = false;
                     lastCursorFrameTimeNanos = 0L;
@@ -292,7 +322,6 @@ public class MainActivity extends AppCompatActivity {
             Choreographer.getInstance().removeFrameCallback(frameCallback);
         }
 
-        // ---------- Auto-hide ----------
         private void resetAutoHideTimer() {
             if (!cursorAutoHideEnabled || !localCursorModeEnabled) return;
             cancelAutoHideTimer();
@@ -328,7 +357,6 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        // ---------- Navigation ----------
         void toggleCursorMode() {
             localCursorModeEnabled = !localCursorModeEnabled;
             targetCursorView.setVisibility(localCursorModeEnabled ? View.VISIBLE : View.GONE);
@@ -590,6 +618,10 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        mIsDestroyed = false;
+
+        checkStoragePermission();
+
         geckoView = findViewById(R.id.geckoView);
         urlBar = findViewById(R.id.urlBar);
         progressBar = findViewById(R.id.progressBar);
@@ -640,7 +672,6 @@ public class MainActivity extends AppCompatActivity {
         loadInstalledExtensions();
     }
 
-    // ---------- Top Bar Visibility ----------
     private void showTopBar() {
         if (topBarVisible) return;
         topBarVisible = true;
@@ -656,8 +687,6 @@ public class MainActivity extends AppCompatActivity {
                 .withEndAction(() -> topBar.setVisibility(View.GONE))
                 .start();
     }
-
-    // ---------- Tabs ----------
 
     private void addNewTab(String url, boolean isPrivate) {
         TabData tab = new TabData();
@@ -679,8 +708,8 @@ public class MainActivity extends AppCompatActivity {
 
         newSession.open(sRuntime);
         tabs.add(tab);
-        switchToTab(tabs.size() - 1); // attach to view before loading
-        newSession.loadUri(url);      // load after attachment
+        switchToTab(tabs.size() - 1);
+        newSession.loadUri(url);
     }
 
     private void attachDelegatesToTab(TabData tab) {
@@ -716,6 +745,15 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public GeckoResult<AllowOrDeny> onLoadRequest(GeckoSession session, LoadRequest request) {
                 String url = request.uri;
+                if (url != null && (url.endsWith(".apk") || url.endsWith(".pdf") ||
+                        url.endsWith(".zip") || url.endsWith(".txt") ||
+                        url.matches(".*\\.(mp4|mp3|png|jpg|jpeg|gif|webp).*"))) {
+                    runOnUiThread(() -> {
+                        String fileName = extractFileName(url, null, null);
+                        promptDownloadConfirmation(url, null, null, fileName);
+                    });
+                    return GeckoResult.fromValue(AllowOrDeny.DENY);
+                }
                 if (url != null && url.toLowerCase().endsWith(".xpi")) {
                     runOnUiThread(() -> {
                         new AlertDialog.Builder(MainActivity.this)
@@ -1084,7 +1122,6 @@ public class MainActivity extends AppCompatActivity {
         cursorView.setVisibility(cursorModeEnabled ? View.VISIBLE : View.GONE);
     }
 
-    // ---------- Browser Menu ----------
     private void showBrowserMenu() {
         String[] items = {
             "Tabs (" + tabs.size() + ")",
@@ -1135,7 +1172,6 @@ public class MainActivity extends AppCompatActivity {
         tabs.get(activeTabIndex).session.loadUri("https://burnsymbol.com");
     }
 
-    // ---------- Auto-Hide Cursor Toggle ----------
     private void toggleCursorAutoHide() {
         cursorAutoHideEnabled = !cursorAutoHideEnabled;
         prefs().edit().putBoolean(KEY_CURSOR_AUTO_HIDE, cursorAutoHideEnabled).apply();
@@ -1147,7 +1183,6 @@ public class MainActivity extends AppCompatActivity {
                 Toast.LENGTH_SHORT).show();
     }
 
-    // ---------- JavaScript Toggle ----------
     private void toggleJavaScript() {
         javascriptEnabled = !javascriptEnabled;
         prefs().edit().putBoolean(KEY_JS_ENABLED, javascriptEnabled).apply();
@@ -1162,7 +1197,6 @@ public class MainActivity extends AppCompatActivity {
         Toast.makeText(this, javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF", Toast.LENGTH_SHORT).show();
     }
 
-    // ---------- Desktop Site Toggle ----------
     private void toggleDesktopMode() {
         desktopModeEnabled = !desktopModeEnabled;
         prefs().edit().putBoolean(KEY_DESKTOP_MODE, desktopModeEnabled).apply();
@@ -1186,7 +1220,6 @@ public class MainActivity extends AppCompatActivity {
                 Toast.LENGTH_SHORT).show();
     }
 
-    // ---------- Zoom ----------
     private void applyZoom(TabData tab) {
         String js = "document.documentElement.style.zoom = '" + tab.zoomLevel + "';";
         GeckoJSBridge.evaluateJavascriptNoResult(tab.session, js);
@@ -1220,7 +1253,6 @@ public class MainActivity extends AppCompatActivity {
         return Math.round(value * 100f) / 100f;
     }
 
-    // ---------- Cursor Speed ----------
     private void adjustCursorSpeed(float delta) {
         cursorSpeed = Math.max(MIN_CURSOR_SPEED, Math.min(MAX_CURSOR_SPEED, cursorSpeed + delta));
         prefs().edit().putFloat(KEY_CURSOR_SPEED, cursorSpeed).apply();
@@ -1298,7 +1330,6 @@ public class MainActivity extends AppCompatActivity {
         minusBtn.requestFocus();
     }
 
-    // ---------- Scroll Speed ----------
     private void adjustScrollSpeed(float delta) {
         scrollSpeed = Math.max(MIN_SCROLL_SPEED, Math.min(MAX_SCROLL_SPEED, scrollSpeed + delta));
         prefs().edit().putFloat(KEY_SCROLL_SPEED, scrollSpeed).apply();
@@ -1390,7 +1421,6 @@ public class MainActivity extends AppCompatActivity {
         b.setLayoutParams(lp);
     }
 
-    // ---------- Homepage ----------
     private String getHomepage() {
         return prefs().getString(KEY_HOMEPAGE, DEFAULT_HOMEPAGE);
     }
@@ -1433,7 +1463,6 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    // ---------- Bookmarks ----------
     private JSONArray loadBookmarks() {
         String raw = prefs().getString(KEY_BOOKMARKS, "[]");
         try {
@@ -1574,7 +1603,6 @@ public class MainActivity extends AppCompatActivity {
         bookmarkButton.setText(isBookmarked ? "\u2605" : "\u2606");
     }
 
-    // ---------- Private Browsing ----------
     private void togglePrivateBrowsing() {
         privateBrowsingEnabled = !privateBrowsingEnabled;
         Toast.makeText(this,
@@ -1584,7 +1612,6 @@ public class MainActivity extends AppCompatActivity {
                 Toast.LENGTH_LONG).show();
     }
 
-    // ---------- History ----------
     private JSONArray loadHistory() {
         String raw = prefs().getString(KEY_HISTORY, "[]");
         try {
@@ -1768,11 +1795,15 @@ public class MainActivity extends AppCompatActivity {
         String contentType = headers != null ? headers.get("Content-Type") : null;
         String contentDisposition = headers != null ? headers.get("Content-Disposition") : null;
         final String finalFileName = extractFileName(url, contentDisposition, contentType);
+        promptDownloadConfirmation(url, contentType, contentDisposition, finalFileName);
+    }
 
+    private void promptDownloadConfirmation(String url, String contentType, String contentDisposition, String fileName) {
+        final String finalFileName = fileName != null ? fileName : extractFileName(url, contentDisposition, contentType);
         new AlertDialog.Builder(this)
                 .setTitle("Download this file?")
                 .setMessage(finalFileName + "\n\n" + url)
-                .setPositiveButton("Download", (d, w) -> startFileDownload(response, finalFileName))
+                .setPositiveButton("Download", (d, w) -> startUrlDownload(url, finalFileName))
                 .setNegativeButton("Cancel", null)
                 .show();
     }
@@ -1801,56 +1832,140 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private File getDownloadBaseDir() {
-        return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        File external = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        if (external != null && (external.exists() || external.mkdirs())) {
+            return external;
+        }
+        return getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
     }
 
-    private void startFileDownload(WebResponse response, String fileName) {
-        InputStream body = response.body;
-        if (body == null) {
-            Toast.makeText(this, "No file data received", Toast.LENGTH_SHORT).show();
+    private void startUrlDownload(String url, String fileName) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Storage permission required to download files", Toast.LENGTH_LONG).show();
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_CODE_STORAGE_PERMISSION);
             return;
         }
 
         File baseDir = getDownloadBaseDir();
         File destDir = new File(baseDir, "TVBrowser");
-        destDir.mkdirs();
+        if (!destDir.exists() && !destDir.mkdirs()) {
+            destDir = getCacheDir();
+        }
+
         File destFile = new File(destDir, fileName);
-        String fullPath = destFile.getAbsolutePath();
+        int count = 1;
+        int dot = fileName.lastIndexOf('.');
+
+        while (destFile.exists()) {
+            if (dot > 0) {
+                String base = fileName.substring(0, dot);
+                String ext = fileName.substring(dot);
+                destFile = new File(destDir, base + "(" + count + ")" + ext);
+            } else {
+                destFile = new File(destDir, fileName + "(" + count + ")");
+            }
+            count++;
+        }
+
+        final String fullPath = destFile.getAbsolutePath();
+        final File finalDestFile = destFile;
 
         recordDownload(fileName, fullPath);
         Toast.makeText(this, "Downloading: " + fileName, Toast.LENGTH_SHORT).show();
 
         new Thread(() -> {
-            try (InputStream in = body;
-                 FileOutputStream out = new FileOutputStream(destFile)) {
-                byte[] buffer = new byte[8192];
-                int read;
-                while ((read = in.read(buffer)) != -1) {
-                    out.write(buffer, 0, read);
+            HttpURLConnection conn = null;
+            try {
+                URL u = new URL(url);
+                conn = (HttpURLConnection) u.openConnection();
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(15000);
+                conn.connect();
+
+                try (InputStream in = conn.getInputStream();
+                     FileOutputStream out = new FileOutputStream(finalDestFile)) {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = in.read(buffer)) != -1) {
+                        out.write(buffer, 0, read);
+                    }
                 }
+
                 runOnUiThread(() -> {
                     updateDownloadStatus(fullPath, "complete");
-                    Toast.makeText(this, "Download complete: " + fileName, Toast.LENGTH_SHORT).show();
+                    // ---------- SHOW DIALOG WITH OPEN/INSTALL ----------
+                    showDownloadCompleteDialog(fileName, fullPath, true);
                     android.media.MediaScannerConnection.scanFile(this, new String[]{fullPath}, null, null);
                 });
             } catch (Exception e) {
-                Log.e("TVBrowser", "startFileDownload failed", e);
+                Log.e("TVBrowser", "startUrlDownload failed", e);
                 runOnUiThread(() -> {
                     updateDownloadStatus(fullPath, "failed");
-                    Toast.makeText(this, "Download failed: " + fileName, Toast.LENGTH_SHORT).show();
+                    // Show failure dialog
+                    showDownloadCompleteDialog(fileName, fullPath, false);
                 });
+            } finally {
+                if (conn != null) conn.disconnect();
             }
         }).start();
     }
 
-    // ---------- Long-press link popup ----------
+    private void startFileDownload(WebResponse response, String fileName) {
+        startUrlDownload(response.uri, fileName);
+    }
+
+    // ---------- NEW: Download Complete Dialog (with Open/Install) ----------
+    private void showDownloadCompleteDialog(String fileName, String fullPath, boolean success) {
+        String message = fullPath;
+        if (!success) {
+            message = "Download failed.\n\n" + fullPath;
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle(success ? "Download complete: " + fileName : "Download failed: " + fileName)
+                .setMessage(message);
+
+        if (success) {
+            String actionLabel = fullPath.toLowerCase().endsWith(".apk") ? "Install" : "Open";
+            builder.setPositiveButton(actionLabel, (d, w) -> openDownloadedFile(fullPath));
+        }
+        builder.setNeutralButton("Delete", (d, w) -> {
+            deleteDownloadedFile(fullPath);
+            int idx = findDownloadIndexByPath(fullPath);
+            if (idx >= 0) removeDownloadRecord(idx);
+            Toast.makeText(this, "Deleted: " + fileName, Toast.LENGTH_SHORT).show();
+        });
+        builder.setNegativeButton("Done", null);
+        builder.show();
+    }
+
+    // Helper to find download record by path (needed for deletion)
+    private int findDownloadIndexByPath(String path) {
+        JSONArray arr = loadDownloads();
+        for (int i = 0; i < arr.length(); i++) {
+            try {
+                if (path.equals(arr.getJSONObject(i).optString("path"))) {
+                    return i;
+                }
+            } catch (JSONException e) {
+                Log.e("TVBrowser", "findDownloadIndexByPath failed", e);
+            }
+        }
+        return -1;
+    }
+
+    // ---------- Long-press link popup with Open in New Tab ----------
     private void showLinkPopup(String url, String text) {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle("Link");
         String display = text.isEmpty() ? url : text + "\n" + url;
         builder.setMessage(display);
-        builder.setPositiveButton("Copy Link", (d, w) -> copyToClipboard("Link", url));
-        builder.setNeutralButton("Save Target", (d, w) -> offerSaveForUrl(url));
+        builder.setPositiveButton("Open in New Tab", (d, w) -> {
+            addNewTab(url, privateBrowsingEnabled);
+        });
+        builder.setNeutralButton("Copy Link", (d, w) -> copyToClipboard("Link", url));
         builder.setNegativeButton("Close", null);
         AlertDialog dialog = builder.create();
         dialog.show();
@@ -1870,7 +1985,6 @@ public class MainActivity extends AppCompatActivity {
         Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show();
     }
 
-    // ---------- Image/Media Save ----------
     private boolean hasSaveableExtension(String url) {
         if (url == null) return false;
         try {
@@ -1903,52 +2017,7 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    private void startUrlDownload(String url, String fileName) {
-        File baseDir = getDownloadBaseDir();
-        File destDir = new File(baseDir, "TVBrowser");
-        destDir.mkdirs();
-        File destFile = new File(destDir, fileName);
-        String fullPath = destFile.getAbsolutePath();
-
-        recordDownload(fileName, fullPath);
-        Toast.makeText(this, "Downloading: " + fileName, Toast.LENGTH_SHORT).show();
-
-        new Thread(() -> {
-            HttpURLConnection conn = null;
-            try {
-                URL u = new URL(url);
-                conn = (HttpURLConnection) u.openConnection();
-                conn.setInstanceFollowRedirects(true);
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(15000);
-                conn.connect();
-
-                try (InputStream in = conn.getInputStream();
-                     FileOutputStream out = new FileOutputStream(destFile)) {
-                    byte[] buffer = new byte[8192];
-                    int read;
-                    while ((read = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, read);
-                    }
-                }
-
-                runOnUiThread(() -> {
-                    updateDownloadStatus(fullPath, "complete");
-                    Toast.makeText(this, "Saved: " + fileName, Toast.LENGTH_SHORT).show();
-                    android.media.MediaScannerConnection.scanFile(this, new String[]{fullPath}, null, null);
-                });
-            } catch (Exception e) {
-                Log.e("TVBrowser", "startUrlDownload failed", e);
-                runOnUiThread(() -> {
-                    updateDownloadStatus(fullPath, "failed");
-                    Toast.makeText(this, "Save failed: " + fileName, Toast.LENGTH_SHORT).show();
-                });
-            } finally {
-                if (conn != null) conn.disconnect();
-            }
-        }).start();
-    }
-
+    // ---------- Downloads Manager ----------
     private JSONArray loadDownloads() {
         String raw = prefs().getString(KEY_DOWNLOADS, "[]");
         try {
@@ -2334,7 +2403,7 @@ public class MainActivity extends AppCompatActivity {
                 Toast.makeText(this, "Removed: " + extension.metaData.name, Toast.LENGTH_SHORT).show();
             }),
             error -> runOnUiThread(() ->
-                Toast.makeText(this, "Remove failed: " + error.getMessage(), Toast.LENGTH_LONG).show())
+                    Toast.makeText(this, "Remove failed: " + error.getMessage(), Toast.LENGTH_LONG).show())
         );
     }
 
@@ -2388,15 +2457,41 @@ public class MainActivity extends AppCompatActivity {
         geckoView.requestFocus();
     }
 
+    // ---------- onDestroy (fixed) ----------
     @Override
     protected void onDestroy() {
+        mIsDestroyed = true;
+
         if (mainCursorController != null) {
             mainCursorController.stopFrameLoop();
             mainCursorController.cancelAutoHideTimer();
+            mainCursorController.hideHandler.removeCallbacksAndMessages(null);
+            mainCursorController.centerLongPressHandler.removeCallbacksAndMessages(null);
+            mainCursorController.topBarView = null;
+            mainCursorController.extraHitTargets.clear();
+            mainCursorController.targetSession = null;
+            mainCursorController = null;
         }
+
         for (TabData tab : tabs) {
-            tab.session.close();
+            if (tab.session != null) {
+                tab.session.close();
+                tab.session = null;
+            }
         }
+        tabs.clear();
+
+        for (WebExtension ext : installedExtensions) {
+            ext.setActionDelegate(null);
+        }
+        installedExtensions.clear();
+        extensionActions.clear();
+
+        if (geckoView != null) {
+            geckoView.setSession(null);
+            geckoView = null;
+        }
+
         super.onDestroy();
     }
 }
