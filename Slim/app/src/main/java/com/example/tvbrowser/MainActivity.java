@@ -1,5 +1,6 @@
 package com.example.tvbrowser;
 
+import android.Manifest;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.ClipData;
@@ -7,9 +8,11 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -37,6 +40,7 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.FileProvider;
 import androidx.webkit.WebViewCompat;
@@ -149,7 +153,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_DOWNLOAD_DIR = "download_dir_uri";
     private static final String KEY_DESKTOP_MODE = "desktop_mode_enabled";
     private static final float DEFAULT_CURSOR_SPEED = 10f;
-    private static final float DEFAULT_SCROLL_SPEED = 80f;
+    private static final float DEFAULT_SCROLL_SPEED = 20f;
     private float scrollStep = DEFAULT_SCROLL_SPEED;
     private boolean privateBrowsingEnabled = false;
 
@@ -179,7 +183,7 @@ public class MainActivity extends AppCompatActivity {
 
     // ---------- Cursor auto-hide ----------
     private static final String KEY_CURSOR_AUTO_HIDE = "cursor_auto_hide";
-    private static final long CURSOR_HIDE_DELAY_MS = 10000; // 10 seconds
+    private static final long CURSOR_HIDE_DELAY_MS = 10000;
     private boolean cursorAutoHideEnabled = true;
     private final Handler cursorHideHandler = new Handler();
     private Runnable cursorHideRunnable;
@@ -347,10 +351,33 @@ public class MainActivity extends AppCompatActivity {
     // ---------- Built‑in AdBlock Manager ----------
     private SimpleAdBlockManager adBlockManager;
 
+    // Storage permission
+    private static final int REQUEST_CODE_STORAGE_PERMISSION = 1002;
+
+    private void checkStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Build.VERSION.SDK_INT < 33) {
+            if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{
+                        Manifest.permission.WRITE_EXTERNAL_STORAGE
+                }, REQUEST_CODE_STORAGE_PERMISSION);
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        // No toast – we handle permission absence gracefully in download methods
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        checkStoragePermission();
 
         adBlockManager = new SimpleAdBlockManager(this);
         new Thread(() -> adBlockManager.loadFilters()).start();
@@ -446,9 +473,29 @@ public class MainActivity extends AppCompatActivity {
         tab.view = wv;
 
         wv.setWebViewClient(new WebViewClient() {
+
+            private boolean isFileUrl(String url) {
+                if (url == null) return false;
+                try {
+                    String path = Uri.parse(url).getPath();
+                    if (path == null) return false;
+                    String lowerPath = path.toLowerCase();
+                    return lowerPath.endsWith(".apk") || lowerPath.endsWith(".pdf") ||
+                            lowerPath.endsWith(".zip") || lowerPath.endsWith(".txt") ||
+                            lowerPath.matches(".*\\.(mp4|mp3|png|jpg|jpeg|gif|webp)$");
+                } catch (Exception e) {
+                    return false;
+                }
+            }
+
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
+                if (url != null && isFileUrl(url)) {
+                    view.stopLoading();
+                    promptDownloadConfirmation(url, null, null, null);
+                    return;
+                }
                 if (wv != webView) return;
                 if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                     view.evaluateJavascript(GM_SHIM_JS, null);
@@ -505,6 +552,16 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
                 return super.shouldInterceptRequest(view, request);
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                String url = request.getUrl().toString();
+                if (url != null && isFileUrl(url)) {
+                    promptDownloadConfirmation(url, null, null, null);
+                    return true;
+                }
+                return false;
             }
         });
 
@@ -744,9 +801,11 @@ public class MainActivity extends AppCompatActivity {
         scrollStep = prefs().getFloat(KEY_SCROLL_SPEED, DEFAULT_SCROLL_SPEED);
     }
 
+    // ---------- FIX: loadFromUrlBar with explicit .apk detection ----------
     private void loadFromUrlBar() {
         String input = urlBar.getText().toString().trim();
         if (input.isEmpty()) return;
+
         if (!input.startsWith("http://") && !input.startsWith("https://")) {
             if (input.contains(".") && !input.contains(" ")) {
                 input = "https://" + input;
@@ -754,6 +813,15 @@ public class MainActivity extends AppCompatActivity {
                 input = "https://www.google.com/search?q=" + input;
             }
         }
+
+        // If the URL ends with .apk, show download prompt directly (do not load)
+        if (input.toLowerCase().endsWith(".apk") || 
+            (input.contains("?") && input.substring(0, input.indexOf("?")).toLowerCase().endsWith(".apk"))) {
+            promptDownloadConfirmation(input, null, null, null);
+            hideKeyboard();
+            return;
+        }
+
         webView.loadUrl(input);
         hideKeyboard();
     }
@@ -1631,9 +1699,6 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    /**
-     * Improved file name extraction that handles Google Images, favicon services, etc.
-     */
     private String extractFileName(String url, String contentDisposition, String mimetype) {
         // 1. Try content-disposition
         if (contentDisposition != null) {
@@ -1649,7 +1714,7 @@ public class MainActivity extends AppCompatActivity {
             } catch (Exception e) { /* ignore */ }
         }
 
-        // 2. Handle Google favicon URLs (gstatic.com/faviconV2) – but now we rarely get them
+        // 2. Handle Google favicon URLs (gstatic.com/faviconV2)
         try {
             Uri uri = Uri.parse(url);
             String host = uri.getHost();
@@ -1693,9 +1758,6 @@ public class MainActivity extends AppCompatActivity {
         return android.webkit.URLUtil.guessFileName(realUrl, contentDisposition, mimetype);
     }
 
-    /**
-     * Extract the domain (e.g., "example.com") from a URL.
-     */
     private String extractDomainFromUrl(String url) {
         try {
             Uri uri = Uri.parse(url);
@@ -1793,8 +1855,27 @@ public class MainActivity extends AppCompatActivity {
 
             File baseDir = getDownloadBaseDir();
             File destDir = new File(baseDir, "PanGalacticMonkey");
-            destDir.mkdirs();
+            if (!destDir.exists() && !destDir.mkdirs()) {
+                destDir = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "PanGalacticMonkey");
+                if (!destDir.exists() && !destDir.mkdirs()) {
+                    Toast.makeText(this, "Cannot create download folder", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+            }
             File destFile = new File(destDir, fileName);
+            int count = 1;
+            while (destFile.exists()) {
+                String name = fileName;
+                int dot = fileName.lastIndexOf('.');
+                if (dot > 0) {
+                    String base = fileName.substring(0, dot);
+                    String ext = fileName.substring(dot);
+                    destFile = new File(destDir, base + "(" + count + ")" + ext);
+                } else {
+                    destFile = new File(destDir, fileName + "(" + count + ")");
+                }
+                count++;
+            }
             String fullPath = destFile.getAbsolutePath();
 
             DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
@@ -1814,7 +1895,7 @@ public class MainActivity extends AppCompatActivity {
             watchDownloadCompletion(downloadId, fileName, fullPath);
         } catch (Exception e) {
             Log.e("TVBrowser", "startFileDownload failed", e);
-            Toast.makeText(this, "Download failed to start", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Download failed to start: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 
@@ -2720,7 +2801,7 @@ public class MainActivity extends AppCompatActivity {
         layout.addView(spacer);
     }
 
-    // ---------- Speed Settings ----------
+    // ---------- Speed Settings (with fixed range) ----------
     private void showSpeedSettings() {
         android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
         layout.setOrientation(android.widget.LinearLayout.VERTICAL);
@@ -2767,8 +2848,8 @@ public class MainActivity extends AppCompatActivity {
         layout.addView(scrollLabel);
 
         android.widget.SeekBar scrollSeek = new android.widget.SeekBar(this);
-        scrollSeek.setMax(380);
-        scrollSeek.setProgress((int) scrollStep - 20);
+        scrollSeek.setMax(195);  // allows values 5..200
+        scrollSeek.setProgress((int) scrollStep - 5);
         scrollSeek.setKeyProgressIncrement(1);
         layout.addView(scrollSeek);
 
@@ -2778,9 +2859,9 @@ public class MainActivity extends AppCompatActivity {
         scrollDec.setText("-1");
         scrollDec.setOnClickListener(v -> {
             int val = (int) scrollStep - 1;
-            if (val < 20) val = 20;
+            if (val < 5) val = 5;
             scrollStep = val;
-            scrollSeek.setProgress(val - 20);
+            scrollSeek.setProgress(val - 5);
             scrollLabel.setText("Scroll Speed: " + val);
         });
         scrollBtnRow.addView(scrollDec);
@@ -2789,9 +2870,9 @@ public class MainActivity extends AppCompatActivity {
         scrollInc.setText("+1");
         scrollInc.setOnClickListener(v -> {
             int val = (int) scrollStep + 1;
-            if (val > 400) val = 400;
+            if (val > 200) val = 200;
             scrollStep = val;
-            scrollSeek.setProgress(val - 20);
+            scrollSeek.setProgress(val - 5);
             scrollLabel.setText("Scroll Speed: " + val);
         });
         scrollBtnRow.addView(scrollInc);
@@ -2811,7 +2892,7 @@ public class MainActivity extends AppCompatActivity {
         scrollSeek.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(android.widget.SeekBar seekBar, int progress, boolean fromUser) {
-                int val = progress + 20;
+                int val = progress + 5;
                 scrollStep = val;
                 scrollLabel.setText("Scroll Speed: " + val);
             }
@@ -2974,39 +3055,25 @@ public class MainActivity extends AppCompatActivity {
         Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show();
     }
 
-    // ---------- Long-press link popup ----------
+    // ---------- Updated long‑press popup ----------
     private void showLinkPopup(String url, String text) {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle("Link");
         String display = text.isEmpty() ? url : text + "\n" + url;
         builder.setMessage(display);
-        builder.setPositiveButton("Copy Link", (d, w) -> copyToClipboard("Link", url));
+        builder.setPositiveButton("Open in New Tab", (d, w) -> {
+            addNewTab(url);
+        });
+        builder.setNeutralButton("Copy Link", (d, w) -> copyToClipboard("Link", url));
         builder.setNegativeButton("Close", null);
         AlertDialog dialog = builder.create();
         dialog.show();
         requestDialogButtonFocus(dialog);
     }
 
-    // ---------- Unified long-press with improved favicon filtering ----------
+    // ---------- Fixed long‑press detection ----------
     private void checkLongPressForElement() {
-        // First, try using WebView's HitTestResult
-        WebView.HitTestResult result = webView.getHitTestResult();
-        if (result != null) {
-            int type = result.getType();
-            String extra = result.getExtra();
-            if (extra != null && extra.startsWith("http") && !extra.contains("faviconV2") && !extra.contains("favicon")) {
-                if (type == WebView.HitTestResult.IMAGE_TYPE ||
-                    type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
-                    offerSaveForUrl(extra);
-                    return;
-                } else if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE) {
-                    showLinkPopup(extra, "");
-                    return;
-                }
-            }
-            // If it's a favicon, fall through to JavaScript
-        }
-
+        // First try JavaScript resolver (most reliable)
         String currentUrl = webView.getUrl();
         if (hasSaveableExtension(currentUrl)) {
             offerSaveForUrl(currentUrl);
@@ -3039,13 +3106,11 @@ public class MainActivity extends AppCompatActivity {
                 "})()";
         }
 
-        // Improved resolver: skips any URL containing "favicon", extracts img from anchors,
-        // and prioritises data-src, srcset, and Google imgurl.
+        // Helper resolver – keep existing definition
         String helper =
             "window.__tvResolveElement = window.__tvResolveElement || function(el){" +
             "  var cur = el;" +
             "  for (var depth = 0; cur && depth < 5; depth++, cur = cur.parentElement) {" +
-            "    // IMG tags" +
             "    if (cur.tagName === 'IMG') {" +
             "      var src = cur.src;" +
             "      var dataSrc = cur.dataset.src || cur.getAttribute('data-src') || cur.getAttribute('data-original') || cur.getAttribute('data-lazy-src');" +
@@ -3066,18 +3131,14 @@ public class MainActivity extends AppCompatActivity {
             "      if (src && src.startsWith('http') && !src.includes('faviconV2') && !src.includes('favicon')) {" +
             "        return 'img|' + src;" +
             "      }" +
-            "      // if favicon, continue searching upward" +
             "      continue;" +
             "    }" +
-            "    // VIDEO / AUDIO" +
             "    if (cur.tagName === 'VIDEO' || cur.tagName === 'AUDIO') {" +
             "      var src = cur.currentSrc || cur.src || (cur.querySelector('source[src]') ? cur.querySelector('source[src]').src : '');" +
             "      if (src && src.startsWith('http') && !src.includes('faviconV2') && !src.includes('favicon')) return 'media|' + src;" +
             "    }" +
-            "    // LINK (anchor) – first look for an IMG inside, then fallback to href with imgurl extraction" +
             "    if (cur.tagName === 'A' && cur.href) {" +
             "      var href = cur.href;" +
-            "      // Check for Google imgurl" +
             "      var match = href.match(/[?&]imgurl=([^&]+)/);" +
             "      if (match) {" +
             "        var realUrl = decodeURIComponent(match[1]);" +
@@ -3089,7 +3150,6 @@ public class MainActivity extends AppCompatActivity {
             "          return 'link|' + realUrl + '|' + (cur.innerText || cur.textContent || '');" +
             "        }" +
             "      }" +
-            "      // If href itself is a real image and not favicon" +
             "      if (href.startsWith('http') && !href.includes('faviconV2') && !href.includes('favicon')) {" +
             "        var ext2 = href.split('.').pop().split('?')[0].toLowerCase();" +
             "        if (['jpg','jpeg','png','gif','webp','bmp','svg'].indexOf(ext2) !== -1) {" +
@@ -3098,7 +3158,6 @@ public class MainActivity extends AppCompatActivity {
             "        return 'link|' + href + '|' + (cur.innerText || cur.textContent || '');" +
             "      }" +
             "    }" +
-            "    // Background image" +
             "    var bg = window.getComputedStyle(cur).backgroundImage;" +
             "    var m = bg && bg.match(/url\\(['\"]?(.*?)['\"]?\\)/);" +
             "    if (m && m[1] && m[1].startsWith('http') && !m[1].includes('faviconV2') && !m[1].includes('favicon')) {" +
@@ -3110,16 +3169,35 @@ public class MainActivity extends AppCompatActivity {
 
         webView.evaluateJavascript(helper + js, resultStr -> {
             String data = unescapeJson(resultStr);
-            if (data == null || data.isEmpty()) return;
-            String[] parts = data.split("\\|", -1);
-            if (parts.length < 2) return;
-            String type = parts[0];
-            String url = parts[1];
-            if (type.equals("link")) {
-                String linkText = parts.length > 2 ? parts[2] : "";
-                runOnUiThread(() -> showLinkPopup(url, linkText));
-            } else if (type.equals("img") || type.equals("media")) {
-                runOnUiThread(() -> offerSaveForUrl(url));
+            if (data != null && !data.isEmpty()) {
+                String[] parts = data.split("\\|", -1);
+                if (parts.length >= 2) {
+                    String type = parts[0];
+                    String url = parts[1];
+                    if (type.equals("link")) {
+                        String linkText = parts.length > 2 ? parts[2] : "";
+                        runOnUiThread(() -> showLinkPopup(url, linkText));
+                        return;
+                    } else if (type.equals("img") || type.equals("media")) {
+                        runOnUiThread(() -> offerSaveForUrl(url));
+                        return;
+                    }
+                }
+            }
+
+            // Fallback: use HitTestResult if JavaScript gave nothing
+            WebView.HitTestResult result = webView.getHitTestResult();
+            if (result != null) {
+                int type = result.getType();
+                String extra = result.getExtra();
+                if (extra != null && extra.startsWith("http")) {
+                    if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE) {
+                        runOnUiThread(() -> showLinkPopup(extra, ""));
+                    } else if (type == WebView.HitTestResult.IMAGE_TYPE ||
+                               type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
+                        runOnUiThread(() -> offerSaveForUrl(extra));
+                    }
+                }
             }
         });
     }
