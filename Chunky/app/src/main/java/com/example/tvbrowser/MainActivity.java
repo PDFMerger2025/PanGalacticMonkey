@@ -1,14 +1,12 @@
 package com.example.tvbrowser;
 
-import android.Manifest;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -18,22 +16,25 @@ import android.text.InputType;
 import android.util.Log;
 import android.view.Choreographer;
 import android.view.Gravity;
+import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.MimeTypeMap;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.AdapterView;
 
-import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.FileProvider;
@@ -64,6 +65,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -83,14 +85,15 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_JS_ENABLED = "js_enabled";
     private static final String KEY_DESKTOP_MODE = "desktop_mode";
     private static final String KEY_CURSOR_AUTO_HIDE = "cursor_auto_hide";
+    private static final String KEY_FASTFORWARD_HINT_SHOWN = "fastforward_hint_shown";
 
-    private static final float DEFAULT_CURSOR_SPEED = 10f;
+    private static final float DEFAULT_CURSOR_SPEED = 6f;
     private static final float MIN_CURSOR_SPEED = 2f;
     private static final float MAX_CURSOR_SPEED = 30f;
 
-    private static final float DEFAULT_SCROLL_SPEED = 40f;
+    private static final float DEFAULT_SCROLL_SPEED = 80f;
     private static final float MIN_SCROLL_SPEED = 5f;
-    private static final float MAX_SCROLL_SPEED = 200f;
+    private static final float MAX_SCROLL_SPEED = 100f;
 
     private static final float DEFAULT_ZOOM = 1.0f;
     private static final float MIN_ZOOM = 0.5f;
@@ -110,6 +113,9 @@ public class MainActivity extends AppCompatActivity {
         "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
         "zip", "rar", "7z", "apk", "txt"
     ));
+
+    // Scroll anchor candidates for find-based scrolling
+    private static final String[] SCROLL_ANCHOR_CANDIDATES = {"e", "a", "o", "i", "0", "1"};
 
     private static GeckoRuntime sRuntime;
     private GeckoView geckoView;
@@ -146,27 +152,12 @@ public class MainActivity extends AppCompatActivity {
     private boolean cursorAutoHideEnabled = true;
     private static final long CURSOR_HIDE_DELAY_MS = 10000;
 
-    private boolean mIsDestroyed = false;
+    // ---------- Smart find-based scroll: state fields ----------
+    private String currentScrollAnchor = null;
+    private Consumer<String> pendingIframeFindCallback = null;
 
-    // Storage permission
-    private static final int REQUEST_CODE_STORAGE_PERMISSION = 1002;
-
-    private void checkStoragePermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Build.VERSION.SDK_INT < 33) {
-            if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                    != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{
-                        Manifest.permission.WRITE_EXTERNAL_STORAGE
-                }, REQUEST_CODE_STORAGE_PERMISSION);
-            }
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
-                                           @NonNull int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-    }
+    // Track current URL for extension origin extraction
+    private String currentSessionUrl = null;
 
     private static class TabData {
         GeckoSession session;
@@ -182,6 +173,51 @@ public class MainActivity extends AppCompatActivity {
     private android.content.SharedPreferences prefs() {
         return getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
     }
+
+    // ---------- uBlock panel direct navigation (kept for future use) ----------
+    private static final String UBLOCK_FILTER_LISTS_URL_SUFFIX = "dashboard.html#3p-filters.html";
+
+    private void openUblockFilterListsDirectly() {
+        GeckoSession session = getActiveSession();
+        if (session == null) return;
+
+        String extensionOrigin = extractExtensionOrigin(currentSessionUrl);
+        if (extensionOrigin == null) return;
+
+        String directUrl = extensionOrigin + UBLOCK_FILTER_LISTS_URL_SUFFIX;
+        Log.d("PanelDirect", "Navigating to: " + directUrl);
+        session.load(new GeckoSession.Loader().uri(directUrl));
+    }
+
+    private String extractExtensionOrigin(String url) {
+        if (url == null) return null;
+        int schemeEnd = url.indexOf("://");
+        if (schemeEnd == -1) return null;
+        int pathStart = url.indexOf('/', schemeEnd + 3);
+        if (pathStart == -1) return url.endsWith("/") ? url : url + "/";
+        return url.substring(0, pathStart + 1);
+    }
+
+    /**
+     * Creates a new GeckoSession with desktop viewport mode if the URL is an extension page.
+     * This forces the page to lay out at desktop width.
+     */
+    private GeckoSession createSessionForUrl(String url, boolean isPrivate) {
+        boolean isExtensionPage = url != null && url.startsWith("moz-extension://");
+
+        GeckoSessionSettings.Builder builder = new GeckoSessionSettings.Builder()
+                .usePrivateMode(isPrivate);
+
+        if (isExtensionPage) {
+            builder.viewportMode(GeckoSessionSettings.VIEWPORT_MODE_DESKTOP);
+        }
+
+        GeckoSession session = new GeckoSession(builder.build());
+        session.open(sRuntime);
+        return session;
+    }
+
+    // ---------- Cursor controller ----------
 
     private class CursorController {
         static final float CURSOR_MAX_MULTIPLIER = 3.0f;
@@ -217,11 +253,6 @@ public class MainActivity extends AppCompatActivity {
         final Choreographer.FrameCallback frameCallback = new Choreographer.FrameCallback() {
             @Override
             public void doFrame(long frameTimeNanos) {
-                if (mIsDestroyed) {
-                    stopFrameLoop();
-                    return;
-                }
-
                 if (heldDirectionKeys.isEmpty() || !localCursorModeEnabled) {
                     cursorFrameLoopRunning = false;
                     lastCursorFrameTimeNanos = 0L;
@@ -372,11 +403,51 @@ public class MainActivity extends AppCompatActivity {
             targetGeckoView.requestFocus();
         }
 
+        private void synthesizeScrollAtCursor(float vscrollAmount) {
+            if (targetSession == null) return;
+            float cursorX = targetCursorView.getCursorX();
+            float cursorY = targetCursorView.getCursorY();
+            long now = SystemClock.uptimeMillis();
+
+            MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[1];
+            props[0] = new MotionEvent.PointerProperties();
+            props[0].id = 0;
+            props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
+
+            MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[1];
+            coords[0] = new MotionEvent.PointerCoords();
+            coords[0].x = cursorX;
+            coords[0].y = cursorY;
+            coords[0].setAxisValue(MotionEvent.AXIS_VSCROLL, vscrollAmount);
+
+            MotionEvent scrollEvent = MotionEvent.obtain(
+                    now, now, MotionEvent.ACTION_SCROLL, 1,
+                    props, coords, 0, 0, 1f, 1f, 0, 0,
+                    InputDevice.SOURCE_CLASS_POINTER | InputDevice.SOURCE_MOUSE, 0
+            );
+
+            targetSession.getPanZoomController().onMotionEvent(scrollEvent);
+            scrollEvent.recycle();
+        }
+
         void scrollPage(float deltaX, float deltaY) {
             if (targetSession == null) return;
-            targetSession.getPanZoomController().scrollBy(
-                    ScreenLength.fromPixels(deltaX),
-                    ScreenLength.fromPixels(deltaY));
+
+            String currentUrl = (activeTabIndex >= 0 && activeTabIndex < tabs.size())
+                    ? tabs.get(activeTabIndex).url
+                    : null;
+
+            if (currentUrl != null && currentUrl.startsWith("moz-extension://")) {
+                if (Math.abs(deltaY) > 1) {
+                    float amount = (deltaY > 0) ? -1.0f : 1.0f;
+                    synthesizeScrollAtCursor(amount);
+                }
+            } else {
+                targetSession.getPanZoomController().scrollBy(
+                        ScreenLength.fromPixels(deltaX),
+                        ScreenLength.fromPixels(deltaY));
+            }
+
             if (!isPopup) {
                 if (deltaY > 0) {
                     runOnUiThread(MainActivity.this::hideTopBar);
@@ -444,9 +515,24 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
+            String js = "(function(){" +
+                    "  if (typeof __tvClick !== 'function') return 'no-helper';" +
+                    "  return __tvClick(" + localX + ", " + localY + ");" +
+                    "})()";
+            GeckoJSBridge.evaluateJavascript(targetSession, js).then(result -> {
+                Log.d("ClickHelper", "JS __tvClick result: " + result + " at (" + localX + "," + localY + ")");
+                if (result == null || "no-helper".equals(result) || "none".equals(result) || "".equals(result)) {
+                    Log.d("ClickHelper", "Falling back to touch simulation");
+                    runOnUiThread(() -> simulateTouch(localX, localY));
+                }
+                return null;
+            });
+        }
+
+        private void simulateTouch(float localX, float localY) {
             long downTime = SystemClock.uptimeMillis();
             MotionEvent down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, localX, localY, 0);
-            MotionEvent up = MotionEvent.obtain(downTime, downTime + 50, MotionEvent.ACTION_UP, localX, localY, 0);
+            MotionEvent up = MotionEvent.obtain(downTime, downTime + 100, MotionEvent.ACTION_UP, localX, localY, 0);
             targetGeckoView.dispatchTouchEvent(down);
             targetGeckoView.dispatchTouchEvent(up);
             down.recycle();
@@ -618,10 +704,6 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        mIsDestroyed = false;
-
-        checkStoragePermission();
-
         geckoView = findViewById(R.id.geckoView);
         urlBar = findViewById(R.id.urlBar);
         progressBar = findViewById(R.id.progressBar);
@@ -692,24 +774,12 @@ public class MainActivity extends AppCompatActivity {
         TabData tab = new TabData();
         tab.isPrivate = isPrivate;
         tab.url = url;
-
-        GeckoSessionSettings settings = new GeckoSessionSettings.Builder()
-                .usePrivateMode(isPrivate)
-                .allowJavascript(javascriptEnabled)
-                .userAgentMode(desktopModeEnabled
-                        ? GeckoSessionSettings.USER_AGENT_MODE_DESKTOP
-                        : GeckoSessionSettings.USER_AGENT_MODE_MOBILE)
-                .build();
-        GeckoSession newSession = new GeckoSession(settings);
-        tab.session = newSession;
-
-        GeckoJSBridge.attachSession(newSession);
+        tab.session = createSessionForUrl(url, isPrivate);
+        GeckoJSBridge.attachSession(tab.session);
         attachDelegatesToTab(tab);
-
-        newSession.open(sRuntime);
         tabs.add(tab);
         switchToTab(tabs.size() - 1);
-        newSession.loadUri(url);
+        tab.session.loadUri(url);
     }
 
     private void attachDelegatesToTab(TabData tab) {
@@ -720,6 +790,9 @@ public class MainActivity extends AppCompatActivity {
                     String url,
                     java.util.List<GeckoSession.PermissionDelegate.ContentPermission> perms,
                     Boolean hasUserGesture) {
+                // Track current URL for extension origin extraction
+                currentSessionUrl = url;
+
                 tab.url = url;
                 if (isActiveTab(tab)) {
                     runOnUiThread(() -> {
@@ -729,6 +802,28 @@ public class MainActivity extends AppCompatActivity {
                 }
                 if (!tab.isPrivate) {
                     recordHistory(tab.title, url);
+                }
+                if (url != null && url.startsWith("moz-extension://")) {
+                    Log.d("ExtensionNav", "Main tab navigated to moz-extension: " + url);
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                            "Extension page loaded: " + url.substring(0, Math.min(60, url.length())),
+                            Toast.LENGTH_SHORT).show());
+
+                    // Show fast-forward hint only on moz-extension pages, once
+                    if (!prefs().getBoolean(KEY_FASTFORWARD_HINT_SHOWN, false)) {
+                        Toast.makeText(MainActivity.this, "Hold fast-forward button to scroll down", Toast.LENGTH_LONG).show();
+                        prefs().edit().putBoolean(KEY_FASTFORWARD_HINT_SHOWN, true).apply();
+                    }
+                }
+
+                // ---- Iframe find marker handling ----
+                if (url != null && url.contains("#__findresult__")) {
+                    String status = url.substring(url.indexOf("#__findresult__") + "#__findresult__".length());
+                    if (pendingIframeFindCallback != null) {
+                        Consumer<String> cb = pendingIframeFindCallback;
+                        pendingIframeFindCallback = null;
+                        cb.accept(status);
+                    }
                 }
             }
 
@@ -745,14 +840,8 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public GeckoResult<AllowOrDeny> onLoadRequest(GeckoSession session, LoadRequest request) {
                 String url = request.uri;
-                if (url != null && (url.endsWith(".apk") || url.endsWith(".pdf") ||
-                        url.endsWith(".zip") || url.endsWith(".txt") ||
-                        url.matches(".*\\.(mp4|mp3|png|jpg|jpeg|gif|webp).*"))) {
-                    runOnUiThread(() -> {
-                        String fileName = extractFileName(url, null, null);
-                        promptDownloadConfirmation(url, null, null, fileName);
-                    });
-                    return GeckoResult.fromValue(AllowOrDeny.DENY);
+                if (url != null && url.startsWith("moz-extension://")) {
+                    Log.d("ExtensionNav", "Main tab loadRequest for moz-extension: " + url);
                 }
                 if (url != null && url.toLowerCase().endsWith(".xpi")) {
                     runOnUiThread(() -> {
@@ -770,6 +859,9 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public GeckoResult<GeckoSession> onNewSession(GeckoSession session, String uri) {
+                if (uri != null && uri.startsWith("moz-extension://")) {
+                    Log.d("ExtensionNav", "Main tab onNewSession for moz-extension: " + uri);
+                }
                 session.loadUri(uri);
                 return GeckoResult.fromValue(session);
             }
@@ -784,6 +876,9 @@ public class MainActivity extends AppCompatActivity {
                         progressBar.setProgress(0);
                     });
                 }
+                if (url != null && url.startsWith("moz-extension://")) {
+                    Log.d("ExtensionNav", "Main tab pageStart for moz-extension: " + url);
+                }
             }
 
             @Override
@@ -791,8 +886,8 @@ public class MainActivity extends AppCompatActivity {
                 if (isActiveTab(tab)) {
                     runOnUiThread(() -> progressBar.setVisibility(View.GONE));
                 }
+                injectClickHelper(session);
                 injectTabNavScript(session);
-                injectZoomLock(session);
                 applyZoom(tab);
                 if (isActiveTab(tab) && mainCursorController != null && !mainCursorController.localCursorModeEnabled) {
                     GeckoJSBridge.evaluateJavascriptNoResult(session,
@@ -1011,20 +1106,327 @@ public class MainActivity extends AppCompatActivity {
             "if(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable){ el.focus({preventScroll:true}); } " +
             "else { el.click(); } return 'ok'; }" +
             "};" +
+            "window.__tvResolveElement = window.__tvResolveElement || function(el){" +
+            "  var cur = el;" +
+            "  for (var depth = 0; cur && depth < 4; depth++, cur = cur.parentElement) {" +
+            "    if (cur.tagName === 'IMG' && cur.src) return 'img|' + cur.src;" +
+            "    if ((cur.tagName === 'VIDEO' || cur.tagName === 'AUDIO')) {" +
+            "      var src = cur.currentSrc || cur.src || (cur.querySelector('source[src]') ? cur.querySelector('source[src]').src : '');" +
+            "      if (src) return 'media|' + src;" +
+            "    }" +
+            "    if (cur.tagName === 'A' && cur.href) return 'link|' + cur.href + '|' + (cur.innerText || cur.textContent || '');" +
+            "    var bg = window.getComputedStyle(cur).backgroundImage;" +
+            "    var m = bg && bg.match(/url\\(['\"]?(.*?)['\"]?\\)/);" +
+            "    if (m && m[1]) return 'img|' + m[1];" +
+            "  }" +
+            "  return '';" +
+            "};" +
             "})();";
         GeckoJSBridge.evaluateJavascriptNoResult(session, js);
+        Log.d("ClickHelper", "Injected __tvTabNav via GeckoJSBridge");
     }
 
-    private void injectZoomLock(GeckoSession session) {
+    private void injectClickHelper(GeckoSession session) {
         String js = "(function(){" +
-            "var meta = document.querySelector('meta[name=viewport]');" +
-            "if (!meta) { meta = document.createElement('meta'); meta.name='viewport'; document.head.appendChild(meta); }" +
-            "meta.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no';" +
-            "document.documentElement.style.touchAction = 'pan-x pan-y';" +
-            "})();";
+                "  if (window.__tvClick) return;" +
+                "  function findClickable(doc, x, y){" +
+                "    try{" +
+                "      var el = doc.elementFromPoint(x, y);" +
+                "      if (!el) return null;" +
+                "      if (el.tagName === 'IFRAME'){" +
+                "        var r = el.getBoundingClientRect();" +
+                "        var inner = el.contentDocument || (el.contentWindow && el.contentWindow.document);" +
+                "        if (inner) return findClickable(inner, x - r.left, y - r.top) || el;" +
+                "      }" +
+                "      return el;" +
+                "    }catch(e){ return null; }" +
+                "  }" +
+                "  window.__tvClick = function(localX, localY){" +
+                "    var ratio = window.devicePixelRatio || 1;" +
+                "    var cssX = localX / ratio;" +
+                "    var cssY = localY / ratio;" +
+                "    var el = findClickable(document, cssX, cssY);" +
+                "    if (!el) return 'none';" +
+                "    var cur = el;" +
+                "    for (var depth = 0; cur && depth < 6; depth++, cur = cur.parentElement){" +
+                "      var tag = cur.tagName;" +
+                "      if (tag === 'A' || tag === 'BUTTON' || tag === 'INPUT' ||" +
+                "          tag === 'SELECT' || tag === 'TEXTAREA' ||" +
+                "          cur.onclick || cur.getAttribute('role') === 'button'){" +
+                "        cur.click();" +
+                "        return tag + ':' + (cur.href || (cur.textContent||'').slice(0,40));" +
+                "      }" +
+                "    }" +
+                "    el.click();" +
+                "    return el.tagName + ':fallback';" +
+                "  };" +
+                "})();";
         GeckoJSBridge.evaluateJavascriptNoResult(session, js);
+        Log.d("ClickHelper", "Injected __tvClick via GeckoJSBridge");
     }
 
+    private void applyZoom(TabData tab) {
+        String js = "document.documentElement.style.zoom = '" + tab.zoomLevel + "';";
+        GeckoJSBridge.evaluateJavascriptNoResult(tab.session, js);
+    }
+
+    private void zoomIn() {
+        if (tabs.isEmpty()) return;
+        TabData tab = tabs.get(activeTabIndex);
+        tab.zoomLevel = Math.min(MAX_ZOOM, roundZoom(tab.zoomLevel + ZOOM_STEP));
+        applyZoom(tab);
+        Toast.makeText(this, "Zoom: " + Math.round(tab.zoomLevel * 100) + "%", Toast.LENGTH_SHORT).show();
+    }
+
+    private void zoomOut() {
+        if (tabs.isEmpty()) return;
+        TabData tab = tabs.get(activeTabIndex);
+        tab.zoomLevel = Math.max(MIN_ZOOM, roundZoom(tab.zoomLevel - ZOOM_STEP));
+        applyZoom(tab);
+        Toast.makeText(this, "Zoom: " + Math.round(tab.zoomLevel * 100) + "%", Toast.LENGTH_SHORT).show();
+    }
+
+    private void resetZoom() {
+        if (tabs.isEmpty()) return;
+        TabData tab = tabs.get(activeTabIndex);
+        tab.zoomLevel = DEFAULT_ZOOM;
+        applyZoom(tab);
+        Toast.makeText(this, "Zoom reset to 100%", Toast.LENGTH_SHORT).show();
+    }
+
+    private float roundZoom(float value) {
+        return Math.round(value * 100f) / 100f;
+    }
+
+    private GeckoSession getActiveSession() {
+        if (activeTabIndex >= 0 && activeTabIndex < tabs.size()) {
+            return tabs.get(activeTabIndex).session;
+        }
+        return null;
+    }
+
+    // ---------- Smart find-based scroll (kept for fast-forward button) ----------
+    private void expandAllSectionsThenFindInIframe(GeckoSession session, String anchor, boolean forward, Consumer<Boolean> callback) {
+        String escapedAnchor = anchor.replace("'", "\\'").toLowerCase();
+        String js = "javascript:(function(){" +
+                "var expandedAny=false;" +
+                "document.querySelectorAll('[aria-expanded=\"false\"],.collapsed,.closed,[role=\"button\"][aria-expanded=\"false\"]').forEach(function(el){" +
+                "  try{ el.click(); expandedAny=true; }catch(e){}" +
+                "});" +
+                "var iframes=document.querySelectorAll('iframe');" +
+                "var status='none';" +
+                "for(var i=0;i<iframes.length;i++){" +
+                "  try{" +
+                "    var doc=iframes[i].contentDocument||iframes[i].contentWindow.document;" +
+                "    if(!doc) continue;" +
+                "    var found=doc.querySelectorAll('*');" +
+                "    for(var j=0;j<found.length;j++){" +
+                "      var text=(found[j].textContent||'').toLowerCase();" +
+                "      if(text.indexOf('" + escapedAnchor + "')>=0){" +
+                "        var rect=found[j].getBoundingClientRect();" +
+                "        var iframeRect=iframes[i].getBoundingClientRect();" +
+                "        var targetY=iframeRect.top+rect.top+rect.height/2;" +
+                "        window.scrollTo(0, targetY - window.innerHeight/2);" +
+                "        status='iframe_found';" +
+                "        break;" +
+                "      }" +
+                "    }" +
+                "  }catch(e){}" +
+                "  if(status==='iframe_found') break;" +
+                "}" +
+                "if(status==='none' && expandedAny) status='expanded';" +
+                "window.location.hash='__findresult__'+status;" +
+                "})();";
+
+        pendingIframeFindCallback = (status) -> {
+            if ("iframe_found".equals(status)) {
+                callback.accept(true);
+            } else if ("expanded".equals(status)) {
+                new Handler(Looper.getMainLooper()).postDelayed(() ->
+                        expandAllSectionsThenFindInIframe(session, anchor, forward, callback), 300);
+            } else {
+                callback.accept(false);
+            }
+        };
+        session.load(new GeckoSession.Loader().uri(js));
+    }
+
+    private void scrollDownUsingFind() {
+        GeckoSession session = getActiveSession();
+        if (session == null) return;
+
+        if (currentScrollAnchor != null) {
+            session.getFinder().find(currentScrollAnchor, GeckoSession.FINDER_FIND_FORWARD)
+                    .accept(result -> {
+                        if (result == null || !result.found) {
+                            expandAllSectionsThenFindInIframe(session, currentScrollAnchor, true, found -> {
+                                if (!found) {
+                                    currentScrollAnchor = null;
+                                    scrollDownUsingFind();
+                                } else {
+                                    Log.d("Scroll", "Continued in-iframe scroll using '" + currentScrollAnchor + "'");
+                                }
+                            });
+                        } else {
+                            Log.d("Scroll", "Scrolled down using anchor '" + currentScrollAnchor
+                                    + "' (" + result.current + "/" + result.total + ")");
+                        }
+                    }, error -> {
+                        currentScrollAnchor = null;
+                        scrollDownUsingFind();
+                    });
+            return;
+        }
+        tryAnchorFind(session, 0, true);
+    }
+
+    private void tryAnchorFind(GeckoSession session, int index, boolean forward) {
+        if (index >= SCROLL_ANCHOR_CANDIDATES.length) {
+            Log.d("Scroll", "No anchor found, using space fallback");
+            session.getFinder().find(" ", forward ? GeckoSession.FINDER_FIND_FORWARD : GeckoSession.FINDER_FIND_BACKWARDS)
+                    .accept(r -> {}, e -> {});
+            return;
+        }
+        String anchor = SCROLL_ANCHOR_CANDIDATES[index];
+        session.getFinder().find(anchor, forward ? GeckoSession.FINDER_FIND_FORWARD : GeckoSession.FINDER_FIND_BACKWARDS)
+                .accept(result -> {
+                    if (result != null && result.found) {
+                        if (forward) {
+                            currentScrollAnchor = anchor;
+                            Log.d("Scroll", "Using anchor '" + anchor + "' for forward scroll");
+                        }
+                    } else {
+                        expandAllSectionsThenFindInIframe(session, anchor, forward, found -> {
+                            if (!found) {
+                                tryAnchorFind(session, index + 1, forward);
+                            } else {
+                                Log.d("Scroll", "Found anchor '" + anchor + "' in iframe");
+                                if (forward) {
+                                    currentScrollAnchor = anchor;
+                                }
+                            }
+                        });
+                    }
+                }, error -> tryAnchorFind(session, index + 1, forward));
+    }
+
+    // ---------- Wrapping menu (pruned) ----------
+    private void showWrappingMenu() {
+        final String[] items = {
+            "Extensions",
+            "Tabs (" + tabs.size() + ")",
+            "Bookmarks",
+            "History",
+            "Downloads",
+            "Zoom In",
+            "Zoom Out",
+            "Reset Zoom",
+            "Cursor Speed",
+            "Scroll Speed",
+            cursorAutoHideEnabled ? "Auto‑Hide Cursor: ON" : "Auto‑Hide Cursor: OFF",
+            javascriptEnabled ? "JavaScript: ON" : "JavaScript: OFF",
+            desktopModeEnabled ? "Desktop Site: ON" : "Desktop Site: OFF",
+            privateBrowsingEnabled ? "Private Browsing: ON" : "Private Browsing: OFF",
+            "Change Homepage",
+            "Created by burnSYMBOL.com"
+        };
+
+        ListView listView = new ListView(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, items);
+        listView.setAdapter(adapter);
+        listView.setBackgroundColor(Color.parseColor("#222222"));
+        listView.setSelector(new ColorDrawable(Color.TRANSPARENT));
+        listView.setFocusable(true);
+        listView.setFocusableInTouchMode(true);
+        listView.setItemsCanFocus(false);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Menu")
+                .setView(listView)
+                .setNegativeButton("Close", null)
+                .create();
+
+        listView.setOnItemSelectedListener(new ListView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                // Reset all items to default
+                for (int i = 0; i < parent.getChildCount(); i++) {
+                    View child = parent.getChildAt(i);
+                    if (child != null) {
+                        child.setBackgroundColor(Color.TRANSPARENT);
+                        if (child instanceof TextView) {
+                            ((TextView) child).setTextColor(Color.WHITE);
+                        }
+                    }
+                }
+                // Highlight the selected item
+                if (view != null) {
+                    view.setBackgroundColor(Color.parseColor("#03fc6f"));
+                    if (view instanceof TextView) {
+                        ((TextView) view).setTextColor(Color.BLACK);
+                    }
+                }
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) { }
+        });
+
+        listView.setOnKeyListener((v, keyCode, event) -> {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                int position = listView.getSelectedItemPosition();
+                if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+                    if (position <= 0) {
+                        listView.setSelection(items.length - 1);
+                        return true;
+                    }
+                } else if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+                    if (position >= items.length - 1) {
+                        listView.setSelection(0);
+                        return true;
+                    }
+                } else if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+                    if (position >= 0 && position < items.length) {
+                        handleMenuItem(position);
+                        dialog.dismiss();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        });
+
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            handleMenuItem(position);
+            dialog.dismiss();
+        });
+
+        dialog.show();
+        listView.post(() -> listView.requestFocus());
+    }
+
+    private void handleMenuItem(int which) {
+        switch (which) {
+            case 0: promptInstallExtension(); break;
+            case 1: showTabsSwitcher(); break;
+            case 2: showBookmarksList(); break;
+            case 3: showHistoryManager(); break;
+            case 4: showDownloadsManager(); break;
+            case 5: zoomIn(); break;
+            case 6: zoomOut(); break;
+            case 7: resetZoom(); break;
+            case 8: showCursorSpeedDialog(); break;
+            case 9: showScrollSpeedDialog(); break;
+            case 10: toggleCursorAutoHide(); break;
+            case 11: toggleJavaScript(); break;
+            case 12: toggleDesktopMode(); break;
+            case 13: togglePrivateBrowsing(); break;
+            case 14: promptChangeHomepage(); break;
+            case 15: openBurnSymbolWebsite(); break;
+        }
+    }
+
+    // ---------- UI listeners and key handling ----------
     private void setupUiListeners() {
         goButton.setOnClickListener(v -> { if (!tabs.isEmpty()) tabs.get(activeTabIndex).session.reload(); });
         homeButton.setOnClickListener(v -> { if (!tabs.isEmpty()) tabs.get(activeTabIndex).session.loadUri(getHomepage()); });
@@ -1033,7 +1435,7 @@ public class MainActivity extends AppCompatActivity {
         backButton.setOnClickListener(v -> { if (canGoBack && !tabs.isEmpty()) tabs.get(activeTabIndex).session.goBack(); });
         forwardButton.setOnClickListener(v -> { if (canGoForward && !tabs.isEmpty()) tabs.get(activeTabIndex).session.goForward(); });
         cursorModeButton.setOnClickListener(v -> toggleCursorMode());
-        extensionsButton.setOnClickListener(v -> showBrowserMenu());
+        extensionsButton.setOnClickListener(v -> showWrappingMenu());
     }
 
     @Override
@@ -1056,13 +1458,9 @@ public class MainActivity extends AppCompatActivity {
             return true;
         }
 
-        if (keyCode == KeyEvent.KEYCODE_MEDIA_REWIND && event.getAction() == KeyEvent.ACTION_DOWN) {
-            if (canGoBack && !tabs.isEmpty()) tabs.get(activeTabIndex).session.goBack();
-            return true;
-        }
-
+        // Fast-forward still triggers scroll down
         if (keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD && event.getAction() == KeyEvent.ACTION_DOWN) {
-            if (canGoForward && !tabs.isEmpty()) tabs.get(activeTabIndex).session.goForward();
+            scrollDownUsingFind();
             return true;
         }
 
@@ -1122,49 +1520,446 @@ public class MainActivity extends AppCompatActivity {
         cursorView.setVisibility(cursorModeEnabled ? View.VISIBLE : View.GONE);
     }
 
-    private void showBrowserMenu() {
-        String[] items = {
-            "Tabs (" + tabs.size() + ")",
-            "Bookmarks",
-            "History",
-            "Downloads",
-            "Zoom In",
-            "Zoom Out",
-            "Reset Zoom",
-            "Cursor Speed",
-            "Scroll Speed",
-            cursorAutoHideEnabled ? "Auto‑Hide Cursor: ON" : "Auto‑Hide Cursor: OFF",
-            javascriptEnabled ? "JavaScript: ON (tap to disable)" : "JavaScript: OFF (tap to enable)",
-            desktopModeEnabled ? "Desktop Site: ON (tap to disable)" : "Desktop Site: OFF (tap to enable)",
-            privateBrowsingEnabled ? "Private Browsing: ON (tap to disable)" : "Private Browsing: OFF (tap to enable)",
-            "Change Homepage",
-            "Extensions",
-            "Created by burnSYMBOL.com"
-        };
+    // ---------- Extensions (with install toast) ----------
+    private void refreshInstalledExtensions() {
+        if (sRuntime == null) return;
+        sRuntime.getWebExtensionController().list().accept(list -> {
+            installedExtensions.clear();
+            for (WebExtension ext : list) {
+                if (JS_BRIDGE_ID.equals(ext.id)) continue;
+                installedExtensions.add(ext);
+                if (!extensionActions.containsKey(ext.id)) {
+                    registerExtensionActionDelegate(ext);
+                }
+            }
+        }, error -> Log.e("MainActivity", "Failed to refresh extensions", error));
+    }
+
+    private WebExtension getRefreshedExtension(WebExtension oldExt) {
+        refreshInstalledExtensions();
+        for (WebExtension ext : installedExtensions) {
+            if (ext.id.equals(oldExt.id)) {
+                return ext;
+            }
+        }
+        return null;
+    }
+
+    private void promptInstallExtension() {
+        refreshInstalledExtensions();
+
+        boolean hasDarkReader = false;
+        boolean hasUBlock = false;
+        for (WebExtension ext : installedExtensions) {
+            String name = ext.metaData.name.toLowerCase();
+            if (name.contains("dark reader")) hasDarkReader = true;
+            if (name.contains("ublock origin") || name.contains("uBlock")) hasUBlock = true;
+        }
+
+        List<String> items = new ArrayList<>();
+        List<Runnable> actions = new ArrayList<>();
+
+        if (!hasDarkReader) {
+            items.add("Install: Dark Reader");
+            actions.add(() -> {
+                Toast.makeText(this, "Installing Dark Reader...", Toast.LENGTH_SHORT).show();
+                installExtension(EXTENSION_URLS[0]);
+            });
+        }
+        if (!hasUBlock) {
+            items.add("Install: uBlock Origin");
+            actions.add(() -> {
+                Toast.makeText(this, "Installing uBlock Origin...", Toast.LENGTH_SHORT).show();
+                installExtension(EXTENSION_URLS[1]);
+            });
+        }
+        items.add("Install: Custom .xpi URL...");
+        actions.add(() -> {
+            Toast.makeText(this, "Installing custom extension...", Toast.LENGTH_SHORT).show();
+            promptCustomExtensionUrl();
+        });
+
+        for (WebExtension ext : installedExtensions) {
+            items.add("Manage: " + ext.metaData.name);
+            final WebExtension finalExt = ext;
+            actions.add(() -> showManageExtensionDialog(finalExt));
+        }
+
+        String[] itemArray = items.toArray(new String[0]);
         new AlertDialog.Builder(this)
-                .setTitle("Menu")
-                .setItems(items, (dialog, which) -> {
-                    switch (which) {
-                        case 0: showTabsSwitcher(); break;
-                        case 1: showBookmarksList(); break;
-                        case 2: showHistoryManager(); break;
-                        case 3: showDownloadsManager(); break;
-                        case 4: zoomIn(); break;
-                        case 5: zoomOut(); break;
-                        case 6: resetZoom(); break;
-                        case 7: showCursorSpeedDialog(); break;
-                        case 8: showScrollSpeedDialog(); break;
-                        case 9: toggleCursorAutoHide(); break;
-                        case 10: toggleJavaScript(); break;
-                        case 11: toggleDesktopMode(); break;
-                        case 12: togglePrivateBrowsing(); break;
-                        case 13: promptChangeHomepage(); break;
-                        case 14: promptInstallExtension(); break;
-                        case 15: openBurnSymbolWebsite(); break;
+                .setTitle("Extensions")
+                .setItems(itemArray, (dialog, which) -> {
+                    if (which >= 0 && which < actions.size()) {
+                        actions.get(which).run();
                     }
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
+    }
+
+    private void showManageExtensionDialog(WebExtension extension) {
+        WebExtension refreshed = getRefreshedExtension(extension);
+        if (refreshed == null) {
+            Toast.makeText(this, "Extension not found", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final WebExtension finalExt = refreshed;
+
+        String[] options = {"Open Popup", "Open Settings", "Remove Extension"};
+        new AlertDialog.Builder(this)
+                .setTitle(finalExt.metaData.name)
+                .setItems(options, (dialog, which) -> {
+                    if (which == 0) {
+                        openExtensionPopup(finalExt);
+                    } else if (which == 1) {
+                        openExtensionSettingsPage(finalExt);
+                    } else {
+                        removeExtension(finalExt);
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void openExtensionPopup(WebExtension extension) {
+        WebExtension.Action action = extensionActions.get(extension.id);
+        if (action != null) {
+            action.click();
+            return;
+        }
+        Toast.makeText(this, "No toolbar action available yet for " + extension.metaData.name
+                + " — try loading a webpage first, then retry", Toast.LENGTH_LONG).show();
+    }
+
+    private void openExtensionSettingsPage(WebExtension extension) {
+        WebExtension refreshed = getRefreshedExtension(extension);
+        if (refreshed == null) {
+            Toast.makeText(this, "Extension not available", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        extension = refreshed;
+
+        String url = getExtensionSettingsUrl(extension);
+        if (url != null) {
+            addNewTab(url, privateBrowsingEnabled);
+            Toast.makeText(this, "Opening settings for " + extension.metaData.name, Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(this, "Settings URL not available for " + extension.metaData.name, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private String getExtensionSettingsUrl(WebExtension ext) {
+        String name = ext.metaData.name.toLowerCase();
+        String base = ext.metaData.baseUrl;
+        if (base == null || base.isEmpty()) {
+            Log.w("ExtSettings", "No baseUrl available for " + ext.id);
+            return null;
+        }
+        if (!base.endsWith("/")) base += "/";
+        if (name.contains("dark reader")) {
+            return base + "ui/options/index.html";
+        }
+        if (name.contains("ublock origin")) {
+            return base + "dashboard.html#settings.html";
+        }
+            if (name.contains("adguard")) {
+            return base + "pages/options.html";
+        }    
+        return base + "options.html";
+    }
+
+    private void removeExtension(WebExtension extension) {
+        sRuntime.getWebExtensionController().uninstall(extension).accept(
+            v -> runOnUiThread(() -> {
+                installedExtensions.remove(extension);
+                extensionActions.remove(extension.id);
+                Toast.makeText(this, "Removed: " + extension.metaData.name, Toast.LENGTH_SHORT).show();
+            }),
+            error -> runOnUiThread(() ->
+                Toast.makeText(this, "Remove failed: " + error.getMessage(), Toast.LENGTH_LONG).show())
+        );
+    }
+
+    private void promptCustomExtensionUrl() {
+        final EditText input = new EditText(this);
+        input.setHint("Paste .xpi extension URL");
+        input.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Custom Extension URL")
+                .setView(input)
+                .setPositiveButton("Install", (d, w) -> {
+                    String url = input.getText().toString().trim();
+                    if (!url.isEmpty()) {
+                        Toast.makeText(this, "Installing custom extension...", Toast.LENGTH_SHORT).show();
+                        installExtension(url);
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void installExtension(String xpiUrl) {
+        sRuntime.getWebExtensionController()
+                .install(xpiUrl)
+                .accept(
+                    extension -> runOnUiThread(() -> {
+                        installedExtensions.add(extension);
+                        registerExtensionActionDelegate(extension);
+                        if (!tabs.isEmpty()) tabs.get(activeTabIndex).session.reload();
+                        Toast.makeText(this, "Installed: " + extension.metaData.name, Toast.LENGTH_SHORT).show();
+                    }),
+                    error -> runOnUiThread(() ->
+                            Toast.makeText(this, "Install failed: " + error.getMessage(), Toast.LENGTH_LONG).show())
+                );
+    }
+
+    private void loadInstalledExtensions() {
+        if (sRuntime == null) return;
+        sRuntime.getWebExtensionController().list().accept(list -> {
+            installedExtensions.clear();
+            for (WebExtension ext : list) {
+                if (JS_BRIDGE_ID.equals(ext.id)) continue;
+                installedExtensions.add(ext);
+                registerExtensionActionDelegate(ext);
+            }
+        }, error -> Log.e("MainActivity", "Failed to load extensions", error));
+    }
+
+    private void registerExtensionActionDelegate(WebExtension extension) {
+        extension.setActionDelegate(new WebExtension.ActionDelegate() {
+            @Override
+            public void onBrowserAction(WebExtension extension, GeckoSession session, WebExtension.Action action) {
+                if (session == null) {
+                    extensionActions.put(extension.id, action);
+                }
+            }
+
+            @Override
+            public GeckoResult<GeckoSession> onOpenPopup(WebExtension extension, WebExtension.Action action) {
+                GeckoSessionSettings settings = new GeckoSessionSettings.Builder()
+                        .allowJavascript(true)
+                        .build();
+                GeckoSession popupSession = new GeckoSession(settings);
+                GeckoJSBridge.attachSession(popupSession);
+                runOnUiThread(() -> showExtensionPopupDialog(popupSession));
+                return GeckoResult.fromValue(popupSession);
+            }
+
+            @Override
+            public GeckoResult<GeckoSession> onTogglePopup(WebExtension extension, WebExtension.Action action) {
+                GeckoSessionSettings settings = new GeckoSessionSettings.Builder()
+                        .allowJavascript(true)
+                        .build();
+                GeckoSession popupSession = new GeckoSession(settings);
+                GeckoJSBridge.attachSession(popupSession);
+                runOnUiThread(() -> showExtensionPopupDialog(popupSession));
+                return GeckoResult.fromValue(popupSession);
+            }
+        });
+    }
+
+    private void showExtensionPopupDialog(GeckoSession popupSession) {
+        popupSession.getSettings().setAllowJavascript(true);
+
+        int widthPx = (int) (340 * getResources().getDisplayMetrics().density);
+        int heightPx = (int) (500 * getResources().getDisplayMetrics().density);
+        int closeBarHeightPx = (int) (48 * getResources().getDisplayMetrics().density);
+
+        FrameLayout container = new FrameLayout(this);
+        container.setLayoutParams(new ViewGroup.LayoutParams(widthPx, heightPx));
+
+        GeckoView popupGeckoView = new GeckoView(this);
+        FrameLayout.LayoutParams geckoParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, heightPx - closeBarHeightPx);
+        geckoParams.topMargin = closeBarHeightPx;
+        popupGeckoView.setLayoutParams(geckoParams);
+        popupGeckoView.setSession(popupSession);
+        popupGeckoView.setFocusableInTouchMode(true);
+        popupGeckoView.setFocusable(true);
+
+        CursorView popupCursorView = new CursorView(this);
+        popupCursorView.setLayoutParams(new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, heightPx - closeBarHeightPx));
+        ((FrameLayout.LayoutParams) popupCursorView.getLayoutParams()).topMargin = closeBarHeightPx;
+
+        Button closeButton = new Button(this);
+        closeButton.setText("Close Extension Popup");
+        FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, closeBarHeightPx);
+        closeButton.setLayoutParams(closeParams);
+
+        container.addView(popupGeckoView);
+        container.addView(popupCursorView);
+        container.addView(closeButton);
+
+        AlertDialog[] dialogHolder = new AlertDialog[1];
+
+        final boolean[] canGoBack = {false};
+        final boolean[] canGoForward = {false};
+
+        final String[] initialPopupUrl = new String[]{""};
+        final boolean[] isFirstLocationChange = new boolean[]{true};
+
+        popupSession.setNavigationDelegate(new GeckoSession.NavigationDelegate() {
+            @Override
+            public void onLocationChange(GeckoSession session, String url,
+                    java.util.List<GeckoSession.PermissionDelegate.ContentPermission> perms,
+                    Boolean hasUserGesture) {
+                if (isFirstLocationChange[0]) {
+                    isFirstLocationChange[0] = false;
+                    initialPopupUrl[0] = (url != null) ? url : "";
+                    Log.d("PopupNav", "Initial popup URL: " + initialPopupUrl[0]);
+                }
+
+                if (url != null && url.startsWith("moz-extension://") && !url.equals(initialPopupUrl[0])) {
+                    Log.d("PopupNav", "Popup navigated to different extension page: " + url + " → opening in new tab.");
+                    runOnUiThread(() -> {
+                        Toast.makeText(MainActivity.this,
+                                "Opening extension page in new tab: " + url.substring(0, Math.min(60, url.length())),
+                                Toast.LENGTH_SHORT).show();
+                        if (dialogHolder[0] != null && dialogHolder[0].isShowing()) {
+                            dialogHolder[0].dismiss();
+                        }
+                        addNewTab(url, privateBrowsingEnabled);
+                    });
+                } else if (url != null && url.startsWith("moz-extension://")) {
+                    Log.d("PopupNav", "Popup stayed on same extension page: " + url);
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                            "Popup navigated within extension: " + url.substring(0, Math.min(40, url.length())),
+                            Toast.LENGTH_SHORT).show());
+                }
+
+                // Also handle iframe find marker in popups
+                if (url != null && url.contains("#__findresult__")) {
+                    String status = url.substring(url.indexOf("#__findresult__") + "#__findresult__".length());
+                    if (pendingIframeFindCallback != null) {
+                        Consumer<String> cb = pendingIframeFindCallback;
+                        pendingIframeFindCallback = null;
+                        cb.accept(status);
+                    }
+                }
+            }
+
+            @Override
+            public void onCanGoBack(GeckoSession session, boolean value) {
+                canGoBack[0] = value;
+            }
+
+            @Override
+            public void onCanGoForward(GeckoSession session, boolean value) {
+                canGoForward[0] = value;
+            }
+
+            @Override
+            public GeckoResult<AllowOrDeny> onLoadRequest(GeckoSession session, LoadRequest request) {
+                String uri = request.uri;
+                if (uri != null && uri.startsWith("moz-extension://")) {
+                    Log.d("PopupNav", "Popup loadRequest for moz-extension: " + uri);
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                            "Popup requesting: " + uri.substring(0, Math.min(40, uri.length())),
+                            Toast.LENGTH_SHORT).show());
+                }
+                return GeckoResult.fromValue(AllowOrDeny.ALLOW);
+            }
+
+            @Override
+            public GeckoResult<GeckoSession> onNewSession(GeckoSession session, String uri) {
+                Log.d("PopupNav", "onNewSession: " + uri);
+                runOnUiThread(() -> {
+                    Toast.makeText(MainActivity.this,
+                            "Popup requested new window: " + uri.substring(0, Math.min(40, uri.length())),
+                            Toast.LENGTH_SHORT).show();
+                    if (dialogHolder[0] != null && dialogHolder[0].isShowing()) {
+                        dialogHolder[0].dismiss();
+                    }
+                    addNewTab(uri, privateBrowsingEnabled);
+                });
+                GeckoSession placeholder = new GeckoSession();
+                GeckoJSBridge.attachSession(placeholder);
+                placeholder.open(sRuntime);
+                return GeckoResult.fromValue(placeholder);
+            }
+        });
+
+        popupSession.setContentDelegate(new GeckoSession.ContentDelegate() {
+            @Override
+            public void onTitleChange(GeckoSession session, String title) { }
+
+            @Override
+            public void onExternalResponse(GeckoSession session, WebResponse response) { }
+        });
+
+        popupSession.setProgressDelegate(new GeckoSession.ProgressDelegate() {
+            @Override
+            public void onPageStop(GeckoSession session, boolean success) {
+                injectClickHelper(session);
+                injectTabNavScript(session);
+                Log.d("ClickHelper", "Injected helpers into popup on page stop");
+                if (mainCursorController != null && !mainCursorController.localCursorModeEnabled) {
+                    GeckoJSBridge.evaluateJavascriptNoResult(session,
+                            "window.__tvTabNav && window.__tvTabNav.enable();");
+                }
+            }
+        });
+
+        popupSession.open(sRuntime);
+        injectClickHelper(popupSession);
+        injectTabNavScript(popupSession);
+        Log.d("ClickHelper", "Injected helpers immediately after open");
+
+        sRuntime.getWebExtensionController().setTabActive(popupSession, true);
+
+        boolean startInCursorMode = cursorModeEnabled;
+        CursorController popupController = new CursorController(popupGeckoView, popupCursorView, popupSession, startInCursorMode);
+        popupController.isPopup = true;
+        popupController.extraHitTargets.add(closeButton);
+        popupCursorView.setVisibility(startInCursorMode ? View.VISIBLE : View.GONE);
+        popupController.onAutoHideToggled(cursorAutoHideEnabled);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setView(container)
+                .setOnDismissListener(d -> {
+                    popupController.stopFrameLoop();
+                    popupController.cancelAutoHideTimer();
+                    popupSession.close();
+                    if (!tabs.isEmpty()) {
+                        sRuntime.getWebExtensionController().setTabActive(tabs.get(activeTabIndex).session, true);
+                    }
+                })
+                .create();
+        dialogHolder[0] = dialog;
+
+        closeButton.setOnClickListener(v -> dialog.dismiss());
+
+        dialog.setOnKeyListener((d, keyCode, event) -> {
+            if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                if (canGoBack[0]) {
+                    Log.d("PopupNav", "Popup back: going back in history");
+                    popupSession.goBack();
+                    return true;
+                } else {
+                    Log.d("PopupNav", "Popup back: no history, dismissing");
+                    dialog.dismiss();
+                    return true;
+                }
+            }
+
+            if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) {
+                popupController.toggleCursorMode();
+                return true;
+            }
+
+            return popupController.handleKeyEvent(event);
+        });
+
+        dialog.show();
+        popupGeckoView.post(() -> {
+            popupCursorView.setCursorPosition(popupGeckoView.getWidth() / 2f, popupGeckoView.getHeight() / 2f);
+            popupGeckoView.requestFocus();
+        });
     }
 
     private void openBurnSymbolWebsite() {
@@ -1220,44 +2015,16 @@ public class MainActivity extends AppCompatActivity {
                 Toast.LENGTH_SHORT).show();
     }
 
-    private void applyZoom(TabData tab) {
-        String js = "document.documentElement.style.zoom = '" + tab.zoomLevel + "';";
-        GeckoJSBridge.evaluateJavascriptNoResult(tab.session, js);
+    private void togglePrivateBrowsing() {
+        privateBrowsingEnabled = !privateBrowsingEnabled;
+        Toast.makeText(this,
+                privateBrowsingEnabled
+                        ? "Private browsing ON — new tabs won't be saved to history"
+                        : "Private browsing OFF",
+                Toast.LENGTH_LONG).show();
     }
 
-    private void zoomIn() {
-        if (tabs.isEmpty()) return;
-        TabData tab = tabs.get(activeTabIndex);
-        tab.zoomLevel = Math.min(MAX_ZOOM, roundZoom(tab.zoomLevel + ZOOM_STEP));
-        applyZoom(tab);
-        Toast.makeText(this, "Zoom: " + Math.round(tab.zoomLevel * 100) + "%", Toast.LENGTH_SHORT).show();
-    }
-
-    private void zoomOut() {
-        if (tabs.isEmpty()) return;
-        TabData tab = tabs.get(activeTabIndex);
-        tab.zoomLevel = Math.max(MIN_ZOOM, roundZoom(tab.zoomLevel - ZOOM_STEP));
-        applyZoom(tab);
-        Toast.makeText(this, "Zoom: " + Math.round(tab.zoomLevel * 100) + "%", Toast.LENGTH_SHORT).show();
-    }
-
-    private void resetZoom() {
-        if (tabs.isEmpty()) return;
-        TabData tab = tabs.get(activeTabIndex);
-        tab.zoomLevel = DEFAULT_ZOOM;
-        applyZoom(tab);
-        Toast.makeText(this, "Zoom reset to 100%", Toast.LENGTH_SHORT).show();
-    }
-
-    private float roundZoom(float value) {
-        return Math.round(value * 100f) / 100f;
-    }
-
-    private void adjustCursorSpeed(float delta) {
-        cursorSpeed = Math.max(MIN_CURSOR_SPEED, Math.min(MAX_CURSOR_SPEED, cursorSpeed + delta));
-        prefs().edit().putFloat(KEY_CURSOR_SPEED, cursorSpeed).apply();
-    }
-
+    // Speed dialogs (with green focus)
     private void showCursorSpeedDialog() {
         LinearLayout container = new LinearLayout(this);
         container.setOrientation(LinearLayout.VERTICAL);
@@ -1330,9 +2097,9 @@ public class MainActivity extends AppCompatActivity {
         minusBtn.requestFocus();
     }
 
-    private void adjustScrollSpeed(float delta) {
-        scrollSpeed = Math.max(MIN_SCROLL_SPEED, Math.min(MAX_SCROLL_SPEED, scrollSpeed + delta));
-        prefs().edit().putFloat(KEY_SCROLL_SPEED, scrollSpeed).apply();
+    private void adjustCursorSpeed(float delta) {
+        cursorSpeed = Math.max(MIN_CURSOR_SPEED, Math.min(MAX_CURSOR_SPEED, cursorSpeed + delta));
+        prefs().edit().putFloat(KEY_CURSOR_SPEED, cursorSpeed).apply();
     }
 
     private void showScrollSpeedDialog() {
@@ -1407,12 +2174,17 @@ public class MainActivity extends AppCompatActivity {
         minusBtn.requestFocus();
     }
 
+    private void adjustScrollSpeed(float delta) {
+        scrollSpeed = Math.max(MIN_SCROLL_SPEED, Math.min(MAX_SCROLL_SPEED, scrollSpeed + delta));
+        prefs().edit().putFloat(KEY_SCROLL_SPEED, scrollSpeed).apply();
+    }
+
     private void styleSpeedButton(Button b) {
         b.setTextColor(Color.WHITE);
         b.setBackgroundColor(Color.parseColor("#555555"));
         b.setFocusable(true);
         b.setOnFocusChangeListener((v, hasFocus) -> {
-            b.setBackgroundColor(Color.parseColor(hasFocus ? "#3DFF71" : "#555555"));
+            b.setBackgroundColor(Color.parseColor(hasFocus ? "#03fc6f" : "#555555"));
             b.setTextColor(hasFocus ? Color.BLACK : Color.WHITE);
         });
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -1421,6 +2193,7 @@ public class MainActivity extends AppCompatActivity {
         b.setLayoutParams(lp);
     }
 
+    // ---------- Bookmarks, History, Downloads (unchanged) ----------
     private String getHomepage() {
         return prefs().getString(KEY_HOMEPAGE, DEFAULT_HOMEPAGE);
     }
@@ -1603,15 +2376,6 @@ public class MainActivity extends AppCompatActivity {
         bookmarkButton.setText(isBookmarked ? "\u2605" : "\u2606");
     }
 
-    private void togglePrivateBrowsing() {
-        privateBrowsingEnabled = !privateBrowsingEnabled;
-        Toast.makeText(this,
-                privateBrowsingEnabled
-                        ? "Private browsing ON — new tabs won't be saved to history"
-                        : "Private browsing OFF",
-                Toast.LENGTH_LONG).show();
-    }
-
     private JSONArray loadHistory() {
         String raw = prefs().getString(KEY_HISTORY, "[]");
         try {
@@ -1788,22 +2552,17 @@ public class MainActivity extends AppCompatActivity {
         dialogHolder[0].show();
     }
 
-    // ---------- Downloads ----------
     private void promptDownloadConfirmation(WebResponse response) {
         String url = response.uri;
         Map<String, String> headers = response.headers;
         String contentType = headers != null ? headers.get("Content-Type") : null;
         String contentDisposition = headers != null ? headers.get("Content-Disposition") : null;
         final String finalFileName = extractFileName(url, contentDisposition, contentType);
-        promptDownloadConfirmation(url, contentType, contentDisposition, finalFileName);
-    }
 
-    private void promptDownloadConfirmation(String url, String contentType, String contentDisposition, String fileName) {
-        final String finalFileName = fileName != null ? fileName : extractFileName(url, contentDisposition, contentType);
         new AlertDialog.Builder(this)
                 .setTitle("Download this file?")
                 .setMessage(finalFileName + "\n\n" + url)
-                .setPositiveButton("Download", (d, w) -> startUrlDownload(url, finalFileName))
+                .setPositiveButton("Download", (d, w) -> startFileDownload(response, finalFileName))
                 .setNegativeButton("Cancel", null)
                 .show();
     }
@@ -1832,140 +2591,55 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private File getDownloadBaseDir() {
-        File external = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-        if (external != null && (external.exists() || external.mkdirs())) {
-            return external;
-        }
-        return getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
     }
 
-    private void startUrlDownload(String url, String fileName) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-                checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "Storage permission required to download files", Toast.LENGTH_LONG).show();
-            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_CODE_STORAGE_PERMISSION);
+    private void startFileDownload(WebResponse response, String fileName) {
+        InputStream body = response.body;
+        if (body == null) {
+            Toast.makeText(this, "No file data received", Toast.LENGTH_SHORT).show();
             return;
         }
 
         File baseDir = getDownloadBaseDir();
         File destDir = new File(baseDir, "TVBrowser");
-        if (!destDir.exists() && !destDir.mkdirs()) {
-            destDir = getCacheDir();
-        }
-
+        destDir.mkdirs();
         File destFile = new File(destDir, fileName);
-        int count = 1;
-        int dot = fileName.lastIndexOf('.');
-
-        while (destFile.exists()) {
-            if (dot > 0) {
-                String base = fileName.substring(0, dot);
-                String ext = fileName.substring(dot);
-                destFile = new File(destDir, base + "(" + count + ")" + ext);
-            } else {
-                destFile = new File(destDir, fileName + "(" + count + ")");
-            }
-            count++;
-        }
-
-        final String fullPath = destFile.getAbsolutePath();
-        final File finalDestFile = destFile;
+        String fullPath = destFile.getAbsolutePath();
 
         recordDownload(fileName, fullPath);
         Toast.makeText(this, "Downloading: " + fileName, Toast.LENGTH_SHORT).show();
 
         new Thread(() -> {
-            HttpURLConnection conn = null;
-            try {
-                URL u = new URL(url);
-                conn = (HttpURLConnection) u.openConnection();
-                conn.setInstanceFollowRedirects(true);
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(15000);
-                conn.connect();
-
-                try (InputStream in = conn.getInputStream();
-                     FileOutputStream out = new FileOutputStream(finalDestFile)) {
-                    byte[] buffer = new byte[8192];
-                    int read;
-                    while ((read = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, read);
-                    }
+            try (InputStream in = body;
+                 FileOutputStream out = new FileOutputStream(destFile)) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
                 }
-
                 runOnUiThread(() -> {
                     updateDownloadStatus(fullPath, "complete");
-                    // ---------- SHOW DIALOG WITH OPEN/INSTALL ----------
-                    showDownloadCompleteDialog(fileName, fullPath, true);
+                    Toast.makeText(this, "Download complete: " + fileName, Toast.LENGTH_SHORT).show();
                     android.media.MediaScannerConnection.scanFile(this, new String[]{fullPath}, null, null);
                 });
             } catch (Exception e) {
-                Log.e("TVBrowser", "startUrlDownload failed", e);
+                Log.e("TVBrowser", "startFileDownload failed", e);
                 runOnUiThread(() -> {
                     updateDownloadStatus(fullPath, "failed");
-                    // Show failure dialog
-                    showDownloadCompleteDialog(fileName, fullPath, false);
+                    Toast.makeText(this, "Download failed: " + fileName, Toast.LENGTH_SHORT).show();
                 });
-            } finally {
-                if (conn != null) conn.disconnect();
             }
         }).start();
     }
 
-    private void startFileDownload(WebResponse response, String fileName) {
-        startUrlDownload(response.uri, fileName);
-    }
-
-    // ---------- NEW: Download Complete Dialog (with Open/Install) ----------
-    private void showDownloadCompleteDialog(String fileName, String fullPath, boolean success) {
-        String message = fullPath;
-        if (!success) {
-            message = "Download failed.\n\n" + fullPath;
-        }
-
-        AlertDialog.Builder builder = new AlertDialog.Builder(this)
-                .setTitle(success ? "Download complete: " + fileName : "Download failed: " + fileName)
-                .setMessage(message);
-
-        if (success) {
-            String actionLabel = fullPath.toLowerCase().endsWith(".apk") ? "Install" : "Open";
-            builder.setPositiveButton(actionLabel, (d, w) -> openDownloadedFile(fullPath));
-        }
-        builder.setNeutralButton("Delete", (d, w) -> {
-            deleteDownloadedFile(fullPath);
-            int idx = findDownloadIndexByPath(fullPath);
-            if (idx >= 0) removeDownloadRecord(idx);
-            Toast.makeText(this, "Deleted: " + fileName, Toast.LENGTH_SHORT).show();
-        });
-        builder.setNegativeButton("Done", null);
-        builder.show();
-    }
-
-    // Helper to find download record by path (needed for deletion)
-    private int findDownloadIndexByPath(String path) {
-        JSONArray arr = loadDownloads();
-        for (int i = 0; i < arr.length(); i++) {
-            try {
-                if (path.equals(arr.getJSONObject(i).optString("path"))) {
-                    return i;
-                }
-            } catch (JSONException e) {
-                Log.e("TVBrowser", "findDownloadIndexByPath failed", e);
-            }
-        }
-        return -1;
-    }
-
-    // ---------- Long-press link popup with Open in New Tab ----------
     private void showLinkPopup(String url, String text) {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle("Link");
         String display = text.isEmpty() ? url : text + "\n" + url;
         builder.setMessage(display);
-        builder.setPositiveButton("Open in New Tab", (d, w) -> {
-            addNewTab(url, privateBrowsingEnabled);
-        });
-        builder.setNeutralButton("Copy Link", (d, w) -> copyToClipboard("Link", url));
+        builder.setPositiveButton("Copy Link", (d, w) -> copyToClipboard("Link", url));
+        builder.setNeutralButton("Save Target", (d, w) -> offerSaveForUrl(url));
         builder.setNegativeButton("Close", null);
         AlertDialog dialog = builder.create();
         dialog.show();
@@ -2017,7 +2691,52 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    // ---------- Downloads Manager ----------
+    private void startUrlDownload(String url, String fileName) {
+        File baseDir = getDownloadBaseDir();
+        File destDir = new File(baseDir, "TVBrowser");
+        destDir.mkdirs();
+        File destFile = new File(destDir, fileName);
+        String fullPath = destFile.getAbsolutePath();
+
+        recordDownload(fileName, fullPath);
+        Toast.makeText(this, "Downloading: " + fileName, Toast.LENGTH_SHORT).show();
+
+        new Thread(() -> {
+            HttpURLConnection conn = null;
+            try {
+                URL u = new URL(url);
+                conn = (HttpURLConnection) u.openConnection();
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(15000);
+                conn.connect();
+
+                try (InputStream in = conn.getInputStream();
+                     FileOutputStream out = new FileOutputStream(destFile)) {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = in.read(buffer)) != -1) {
+                        out.write(buffer, 0, read);
+                    }
+                }
+
+                runOnUiThread(() -> {
+                    updateDownloadStatus(fullPath, "complete");
+                    Toast.makeText(this, "Saved: " + fileName, Toast.LENGTH_SHORT).show();
+                    android.media.MediaScannerConnection.scanFile(this, new String[]{fullPath}, null, null);
+                });
+            } catch (Exception e) {
+                Log.e("TVBrowser", "startUrlDownload failed", e);
+                runOnUiThread(() -> {
+                    updateDownloadStatus(fullPath, "failed");
+                    Toast.makeText(this, "Save failed: " + fileName, Toast.LENGTH_SHORT).show();
+                });
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }).start();
+    }
+
     private JSONArray loadDownloads() {
         String raw = prefs().getString(KEY_DOWNLOADS, "[]");
         try {
@@ -2167,7 +2886,7 @@ public class MainActivity extends AppCompatActivity {
         b.setPadding(16, 4, 16, 4);
         b.setFocusable(true);
         b.setOnFocusChangeListener((v, hasFocus) -> {
-            b.setBackgroundColor(Color.parseColor(hasFocus ? "#3DFF71" : "#555555"));
+            b.setBackgroundColor(Color.parseColor(hasFocus ? "#03fc6f" : "#555555"));
             b.setTextColor(hasFocus ? Color.BLACK : Color.WHITE);
         });
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -2215,229 +2934,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ---------- Extensions ----------
-    private void loadInstalledExtensions() {
-        sRuntime.getWebExtensionController().list().accept(list -> {
-            installedExtensions.clear();
-            for (WebExtension ext : list) {
-                if (JS_BRIDGE_ID.equals(ext.id)) continue;
-                installedExtensions.add(ext);
-                registerExtensionActionDelegate(ext);
-            }
-        }, error -> {});
-    }
-
-    private void registerExtensionActionDelegate(WebExtension extension) {
-        extension.setActionDelegate(new WebExtension.ActionDelegate() {
-            @Override
-            public void onBrowserAction(WebExtension extension, GeckoSession session, WebExtension.Action action) {
-                if (session == null) {
-                    extensionActions.put(extension.id, action);
-                }
-            }
-
-            @Override
-            public GeckoResult<GeckoSession> onOpenPopup(WebExtension extension, WebExtension.Action action) {
-                GeckoSession popupSession = new GeckoSession();
-                GeckoJSBridge.attachSession(popupSession);
-                popupSession.open(sRuntime);
-                runOnUiThread(() -> showExtensionPopupDialog(popupSession));
-                return GeckoResult.fromValue(popupSession);
-            }
-
-            @Override
-            public GeckoResult<GeckoSession> onTogglePopup(WebExtension extension, WebExtension.Action action) {
-                GeckoSession popupSession = new GeckoSession();
-                GeckoJSBridge.attachSession(popupSession);
-                popupSession.open(sRuntime);
-                runOnUiThread(() -> showExtensionPopupDialog(popupSession));
-                return GeckoResult.fromValue(popupSession);
-            }
-        });
-    }
-
-    private void showExtensionPopupDialog(GeckoSession popupSession) {
-        int widthPx = (int) (340 * getResources().getDisplayMetrics().density);
-        int heightPx = (int) (500 * getResources().getDisplayMetrics().density);
-        int closeBarHeightPx = (int) (48 * getResources().getDisplayMetrics().density);
-
-        FrameLayout container = new FrameLayout(this);
-        container.setLayoutParams(new ViewGroup.LayoutParams(widthPx, heightPx));
-
-        GeckoView popupGeckoView = new GeckoView(this);
-        FrameLayout.LayoutParams geckoParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, heightPx - closeBarHeightPx);
-        geckoParams.topMargin = closeBarHeightPx;
-        popupGeckoView.setLayoutParams(geckoParams);
-        popupGeckoView.setSession(popupSession);
-        popupGeckoView.setFocusableInTouchMode(true);
-        popupGeckoView.setFocusable(true);
-
-        CursorView popupCursorView = new CursorView(this);
-        popupCursorView.setLayoutParams(new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, heightPx - closeBarHeightPx));
-        ((FrameLayout.LayoutParams) popupCursorView.getLayoutParams()).topMargin = closeBarHeightPx;
-
-        Button closeButton = new Button(this);
-        closeButton.setText("Close Extension Popup");
-        FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, closeBarHeightPx);
-        closeButton.setLayoutParams(closeParams);
-
-        container.addView(popupGeckoView);
-        container.addView(popupCursorView);
-        container.addView(closeButton);
-
-        sRuntime.getWebExtensionController().setTabActive(popupSession, true);
-
-        boolean startInCursorMode = cursorModeEnabled;
-        CursorController popupController = new CursorController(popupGeckoView, popupCursorView, popupSession, startInCursorMode);
-        popupController.isPopup = true;
-        popupController.extraHitTargets.add(closeButton);
-        popupCursorView.setVisibility(startInCursorMode ? View.VISIBLE : View.GONE);
-        popupController.onAutoHideToggled(cursorAutoHideEnabled);
-
-        popupSession.setProgressDelegate(new GeckoSession.ProgressDelegate() {
-            @Override
-            public void onPageStop(GeckoSession session, boolean success) {
-                injectTabNavScript(session);
-                injectZoomLock(session);
-                if (!popupController.localCursorModeEnabled) {
-                    GeckoJSBridge.evaluateJavascriptNoResult(session,
-                            "window.__tvTabNav && window.__tvTabNav.enable();");
-                }
-            }
-        });
-
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setView(container)
-                .setOnDismissListener(d -> {
-                    popupController.stopFrameLoop();
-                    popupController.cancelAutoHideTimer();
-                    popupSession.close();
-                    if (!tabs.isEmpty()) {
-                        sRuntime.getWebExtensionController().setTabActive(tabs.get(activeTabIndex).session, true);
-                    }
-                })
-                .create();
-
-        closeButton.setOnClickListener(v -> dialog.dismiss());
-
-        dialog.setOnKeyListener((d, keyCode, event) -> {
-            if (keyCode == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_DOWN) {
-                dialog.dismiss();
-                return true;
-            }
-            if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE && event.getAction() == KeyEvent.ACTION_DOWN) {
-                popupController.toggleCursorMode();
-                return true;
-            }
-            return popupController.handleKeyEvent(event);
-        });
-
-        dialog.show();
-        popupGeckoView.post(() -> {
-            popupCursorView.setCursorPosition(popupGeckoView.getWidth() / 2f, popupGeckoView.getHeight() / 2f);
-            popupGeckoView.requestFocus();
-        });
-    }
-
-    private void promptInstallExtension() {
-        List<String> menuItems = new ArrayList<>();
-        menuItems.add("Install: Dark Reader");
-        menuItems.add("Install: uBlock Origin");
-        menuItems.add("Install: Custom .xpi URL...");
-        for (WebExtension ext : installedExtensions) {
-            menuItems.add("Manage: " + ext.metaData.name);
-        }
-
-        String[] items = menuItems.toArray(new String[0]);
-        new AlertDialog.Builder(this)
-                .setTitle("Extensions")
-                .setItems(items, (dialog, which) -> {
-                    if (which == 0) {
-                        installExtension(EXTENSION_URLS[0]);
-                    } else if (which == 1) {
-                        installExtension(EXTENSION_URLS[1]);
-                    } else if (which == 2) {
-                        promptCustomExtensionUrl();
-                    } else {
-                        WebExtension selected = installedExtensions.get(which - 3);
-                        showManageExtensionDialog(selected);
-                    }
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    private void showManageExtensionDialog(WebExtension extension) {
-        String[] options = {"Open Settings/Popup", "Remove Extension"};
-        new AlertDialog.Builder(this)
-                .setTitle(extension.metaData.name)
-                .setItems(options, (dialog, which) -> {
-                    if (which == 0) {
-                        openExtensionSettings(extension);
-                    } else {
-                        removeExtension(extension);
-                    }
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    private void openExtensionSettings(WebExtension extension) {
-        WebExtension.Action action = extensionActions.get(extension.id);
-        if (action != null) {
-            action.click();
-            return;
-        }
-        Toast.makeText(this, "No toolbar action available yet for " + extension.metaData.name
-                + " — try loading a webpage first, then retry", Toast.LENGTH_LONG).show();
-    }
-
-    private void removeExtension(WebExtension extension) {
-        sRuntime.getWebExtensionController().uninstall(extension).accept(
-            v -> runOnUiThread(() -> {
-                installedExtensions.remove(extension);
-                extensionActions.remove(extension.id);
-                Toast.makeText(this, "Removed: " + extension.metaData.name, Toast.LENGTH_SHORT).show();
-            }),
-            error -> runOnUiThread(() ->
-                    Toast.makeText(this, "Remove failed: " + error.getMessage(), Toast.LENGTH_LONG).show())
-        );
-    }
-
-    private void promptCustomExtensionUrl() {
-        final EditText input = new EditText(this);
-        input.setHint("Paste .xpi extension URL");
-        input.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
-
-        new AlertDialog.Builder(this)
-                .setTitle("Custom Extension URL")
-                .setView(input)
-                .setPositiveButton("Install", (d, w) -> {
-                    String url = input.getText().toString().trim();
-                    if (!url.isEmpty()) installExtension(url);
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    private void installExtension(String xpiUrl) {
-        sRuntime.getWebExtensionController()
-                .install(xpiUrl)
-                .accept(
-                    extension -> runOnUiThread(() -> {
-                        installedExtensions.add(extension);
-                        registerExtensionActionDelegate(extension);
-                        if (!tabs.isEmpty()) tabs.get(activeTabIndex).session.reload();
-                        Toast.makeText(this, "Installed: " + extension.metaData.name, Toast.LENGTH_SHORT).show();
-                    }),
-                    error -> runOnUiThread(() ->
-                            Toast.makeText(this, "Install failed: " + error.getMessage(), Toast.LENGTH_LONG).show())
-                );
-    }
-
     private void loadFromUrlBar() {
         if (tabs.isEmpty()) return;
         String input = urlBar.getText().toString().trim();
@@ -2457,41 +2953,15 @@ public class MainActivity extends AppCompatActivity {
         geckoView.requestFocus();
     }
 
-    // ---------- onDestroy (fixed) ----------
     @Override
     protected void onDestroy() {
-        mIsDestroyed = true;
-
         if (mainCursorController != null) {
             mainCursorController.stopFrameLoop();
             mainCursorController.cancelAutoHideTimer();
-            mainCursorController.hideHandler.removeCallbacksAndMessages(null);
-            mainCursorController.centerLongPressHandler.removeCallbacksAndMessages(null);
-            mainCursorController.topBarView = null;
-            mainCursorController.extraHitTargets.clear();
-            mainCursorController.targetSession = null;
-            mainCursorController = null;
         }
-
         for (TabData tab : tabs) {
-            if (tab.session != null) {
-                tab.session.close();
-                tab.session = null;
-            }
+            tab.session.close();
         }
-        tabs.clear();
-
-        for (WebExtension ext : installedExtensions) {
-            ext.setActionDelegate(null);
-        }
-        installedExtensions.clear();
-        extensionActions.clear();
-
-        if (geckoView != null) {
-            geckoView.setSession(null);
-            geckoView = null;
-        }
-
         super.onDestroy();
     }
 }
